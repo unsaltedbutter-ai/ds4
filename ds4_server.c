@@ -4679,6 +4679,20 @@ static bool sse_headers(int fd) {
     return send_all(fd, h, strlen(h));
 }
 
+/* Sent when --sse-keepalive-prefill flushed the response headers before prefill
+ * and prefill subsequently failed. The stream is already committed to 200 OK,
+ * so we cannot use http_error; emit a single SSE error event plus [DONE] so
+ * the client surfaces a useful message instead of an unterminated stream. */
+static void sse_error_event(int fd, const char *msg) {
+    buf b = {0};
+    buf_puts(&b, "data: {\"error\":{\"message\":");
+    json_escape(&b, msg ? msg : "prefill failed");
+    buf_puts(&b, ",\"type\":\"server_error\"}}\n\n");
+    (void)send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    (void)send_all(fd, "data: [DONE]\n\n", 14);
+}
+
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
     buf b = {0};
     long now = (long)time(NULL);
@@ -7476,6 +7490,7 @@ struct server {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
+    bool sse_keepalive_prefill;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -9686,6 +9701,9 @@ typedef struct {
     double last_t;
     int last_current;
     bool seen;
+    int fd;
+    bool emit_keepalive;
+    bool client_gone;
 } server_prefill_progress;
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
@@ -9865,6 +9883,13 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                elapsed);
     if (p->srv && current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv);
+    }
+    if (p->emit_keepalive && !p->client_gone) {
+        /* SSE comment lines (lines starting with ':') are ignored by parsers but
+         * keep the TCP connection warm so a client read timeout does not fire
+         * during a very long prefill. */
+        static const char ka[] = ": ds4 prefill keepalive\n\n";
+        if (!send_all(p->fd, ka, sizeof(ka) - 1)) p->client_gone = true;
     }
 }
 
@@ -10315,6 +10340,24 @@ static void generate_job(server *s, job *j) {
                req_flags);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
 
+    bool sse_headers_sent = false;
+    if (j->req.stream && s->sse_keepalive_prefill) {
+        if (!sse_headers(j->fd)) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: %s ctx=%s%s%s sse headers failed",
+                       j->req.kind == REQ_CHAT ? "chat" : "completion",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags);
+            ds4_session_set_progress(s->session, NULL, NULL);
+            ds4_tokens_free(&effective_prompt);
+            return;
+        }
+        sse_headers_sent = true;
+        progress.fd = j->fd;
+        progress.emit_keepalive = true;
+    }
+
     int cold_store_len = 0;
     if (cached == 0 &&
         s->kv.enabled &&
@@ -10336,7 +10379,8 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
             trace_event(s, trace_id, "prefill failed: %s", err);
-            http_error(j->fd, 500, err);
+            if (sse_headers_sent) sse_error_event(j->fd, err);
+            else http_error(j->fd, 500, err);
             return;
         }
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
@@ -10349,7 +10393,20 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         trace_event(s, trace_id, "prefill failed: %s", err);
-        http_error(j->fd, 500, err);
+        if (sse_headers_sent) sse_error_event(j->fd, err);
+        else http_error(j->fd, 500, err);
+        return;
+    }
+    if (progress.client_gone) {
+        ds4_tokens_free(&effective_prompt);
+        ds4_session_set_progress(s->session, NULL, NULL);
+        trace_event(s, trace_id, "client disconnected during prefill");
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: %s ctx=%s%s%s client gone after prefill",
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   ctx_span,
+                   req_flags[0] ? " " : "",
+                   req_flags);
         return;
     }
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
@@ -10384,7 +10441,7 @@ static void generate_job(server *s, job *j) {
     const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
     long responses_created_at = (long)time(NULL);
     if (j->req.stream) {
-        if (!sse_headers(j->fd)) {
+        if (!sse_headers_sent && !sse_headers(j->fd)) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -11245,6 +11302,7 @@ typedef struct {
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
+    bool sse_keepalive_prefill;
     int tool_memory_max_ids;
 } server_config;
 
@@ -11385,6 +11443,13 @@ static void usage(FILE *fp) {
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
         "  --disable-exact-dsml-tool-replay\n"
         "      Disable the tool-id -> exact sampled DSML map. Tool history falls back to canonical JSON rendering.\n"
+        "  --sse-keepalive-prefill\n"
+        "      For streaming requests, flush SSE response headers before prefill and\n"
+        "      emit a comment line per prefill chunk so the client TCP connection\n"
+        "      stays warm during very long prompts. Off by default. Useful when a\n"
+        "      large --ctx allows prefill to exceed typical HTTP client read\n"
+        "      timeouts; without it, the client may disconnect before the server\n"
+        "      finishes prefill and writes its first SSE byte.\n"
         "  --tool-memory-max-ids N\n"
         "      Maximum exact tool-call IDs kept in RAM for replay. Default: 100000\n"
         "\n"
@@ -11485,6 +11550,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
+        } else if (!strcmp(arg, "--sse-keepalive-prefill")) {
+            c.sse_keepalive_prefill = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
@@ -11557,6 +11624,7 @@ int main(int argc, char **argv) {
     s.session = session;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+    s.sse_keepalive_prefill = cfg.sse_keepalive_prefill;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
