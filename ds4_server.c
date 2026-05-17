@@ -8214,6 +8214,7 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
  * carrying stale popularity forever. */
 #define KV_CACHE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
 #define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
+#define KV_CACHE_CHECKPOINT_BASE_HITS 4.0
 #define KV_EXT_TOOL_MAP (1u << 0)
 #define KV_EXT_RESPONSES_VISIBLE (1u << 1)
 #define KV_EXT_THINKING_VISIBLE (1u << 2)
@@ -8843,7 +8844,23 @@ static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
         effective_hits *= exp2(-elapsed / (double)KV_CACHE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
-    return (effective_hits + 1.0) * (double)e->tokens / (double)e->file_size;
+    /* Explicit checkpoints (cold, evict, shutdown) are written specifically
+     * to outlive their own prefill and serve future cross-session lookups.
+     * Continued checkpoints are intermediate restart frontiers that the
+     * superseder is already cleaning up as longer prefixes arrive.  Without
+     * a category-based bias, a freshly written cold or evict has the same
+     * (hits+1) base as a freshly written competing continued, and a tiny
+     * tokens-per-byte difference is enough to make the explicit checkpoint
+     * the lower-scoring victim.  Give cold/evict/shutdown a larger starting
+     * base so they need real accumulated hits on a continued to be ranked
+     * below it, while still decaying back toward parity as they go unused. */
+    double base = 1.0;
+    if (e->reason == KV_REASON_COLD ||
+        e->reason == KV_REASON_EVICT ||
+        e->reason == KV_REASON_SHUTDOWN) {
+        base = KV_CACHE_CHECKPOINT_BASE_HITS;
+    }
+    return (effective_hits + base) * (double)e->tokens / (double)e->file_size;
 }
 
 /* Walk the on-disk index and unlink any continued snapshot whose rendered
@@ -15316,6 +15333,84 @@ static void test_kv_cache_prune_supersedes_keeps_cold_checkpoint(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_boosts_cold_over_continued(void) {
+    char tmpl[] = "/tmp/ds4-kv-boost-cold-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* Two same-size files, both freshly stored with hits=0.  The cold file
+     * has fewer tokens per byte (lower raw density), so without the boost it
+     * would lose the eviction race to the continued.  With the boost it
+     * survives. */
+    const char *cold_sha = "1111111111111111111111111111111111111111";
+    const char *cont_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, cold_sha, KV_REASON_COLD,      1024, 0, now, 4096);
+    test_kv_stub_file(dir, cont_sha, KV_REASON_CONTINUED, 1200, 0, now, 4096);
+
+    char cold_name[44], cont_name[44];
+    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
+    snprintf(cont_name, sizeof(cont_name), "%.40s.kv", cont_sha);
+    char *cold_path = path_join(dir, cold_name);
+    char *cont_path = path_join(dir, cont_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 4096u) + 16u;
+    kv_cache_evict(&kc, NULL, NULL);
+
+    TEST_ASSERT(access(cold_path, F_OK) == 0);
+    TEST_ASSERT(access(cont_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(cold_path);
+    unlink(cont_path);
+    free(cold_path);
+    free(cont_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_boosts_evict_over_continued(void) {
+    char tmpl[] = "/tmp/ds4-kv-boost-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* Same shape as the cold test but with KV_REASON_EVICT.  Live-miss saves
+     * should get the same protection as end-of-prefill cold checkpoints. */
+    const char *evict_sha = "1111111111111111111111111111111111111111";
+    const char *cont_sha  = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, evict_sha, KV_REASON_EVICT,     1024, 0, now, 4096);
+    test_kv_stub_file(dir, cont_sha,  KV_REASON_CONTINUED, 1200, 0, now, 4096);
+
+    char evict_name[44], cont_name[44];
+    snprintf(evict_name, sizeof(evict_name), "%.40s.kv", evict_sha);
+    snprintf(cont_name,  sizeof(cont_name),  "%.40s.kv", cont_sha);
+    char *evict_path = path_join(dir, evict_name);
+    char *cont_path  = path_join(dir, cont_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 4096u) + 16u;
+    kv_cache_evict(&kc, NULL, NULL);
+
+    TEST_ASSERT(access(evict_path, F_OK) == 0);
+    TEST_ASSERT(access(cont_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(evict_path);
+    unlink(cont_path);
+    free(evict_path);
+    free(cont_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     /* stale: lower tokens-per-byte (e.g. tool-heavy prompt) but boosted by
      * 10 hits well in the past.  fresh: higher tokens-per-byte and zero hits,
@@ -15764,6 +15859,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_prune_supersedes_keeps_unrelated();
     test_kv_cache_prune_supersedes_skips_self();
     test_kv_cache_prune_supersedes_keeps_cold_checkpoint();
+    test_kv_cache_eviction_boosts_cold_over_continued();
+    test_kv_cache_eviction_boosts_evict_over_continued();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
