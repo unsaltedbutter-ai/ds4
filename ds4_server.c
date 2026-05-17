@@ -8846,6 +8846,53 @@ static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
     return (effective_hits + 1.0) * (double)e->tokens / (double)e->file_size;
 }
 
+/* Walk the on-disk index and unlink any continued snapshot whose rendered
+ * text is a strict prefix of the new snapshot's rendered text.  Continued
+ * snapshots are intermediate restart frontiers (see the comment in
+ * kv_entry_eviction_score above); once a longer same-prefix snapshot
+ * exists, the shorter continued entry serves no further purpose because
+ * the longer one dominates it on every prefix lookup.  Cold/evict/shutdown
+ * entries on disk are explicit checkpoints (for example the anchor cold
+ * cut at the chat-task boundary) and are left alone so that workloads
+ * which diverge past their length can still hit them.  Skips the new
+ * entry itself.
+ *
+ * Only invoke this when the new store represents a freshly validated
+ * in-progress prefix (continued or cold).  Evict and shutdown stores save
+ * a live state at the moment it has just diverged from an incoming
+ * request, so the saved content may include post-divergence tokens that
+ * no future prompt will match; in that case the shorter continued
+ * snapshots are strict pre-divergence prefixes and remain useful, and the
+ * caller must not call this function.
+ *
+ * The caller is expected to follow up with kv_cache_evict, whose refresh
+ * will rebuild the in-memory index from the post-prune directory state. */
+static void kv_cache_prune_supersedes(kv_disk_cache *kc,
+                                      const char *new_text,
+                                      size_t new_text_len,
+                                      const char *new_sha) {
+    if (!kc->enabled || !new_text || new_text_len == 0 || !new_sha) return;
+    kv_cache_refresh(kc);
+    for (int i = 0; i < kc->len; i++) {
+        const kv_entry *e = &kc->entry[i];
+        if (e->reason != KV_REASON_CONTINUED) continue;
+        if (e->text_bytes == 0 || (size_t)e->text_bytes >= new_text_len) continue;
+        if (!strcmp(e->sha, new_sha)) continue;
+        char prefix_sha[41];
+        sha1_bytes_hex(new_text, (size_t)e->text_bytes, prefix_sha);
+        if (strcmp(prefix_sha, e->sha) != 0) continue;
+        if (unlink(e->path) == 0) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache evicted reason=superseded tokens=%u hits=%u size=%.2f MiB file=%s by=%s",
+                       e->tokens,
+                       e->hits,
+                       (double)e->file_size / (1024.0 * 1024.0),
+                       e->path ? e->path : "?",
+                       new_sha);
+        }
+    }
+}
+
 static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
                            const char *protected_sha) {
     if (!kc->enabled || kc->budget_bytes == 0) return;
@@ -9349,6 +9396,16 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                    text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
                    (double)(KV_CACHE_FIXED_HEADER + 4ull + text_len + payload_bytes + tool_map_bytes) / (1024.0 * 1024.0),
                    save_ms);
+        /* Evict and shutdown stores save a live state that has just diverged
+         * from the next incoming request (or that is about to be discarded);
+         * their full content may include post-divergence tokens that no
+         * future prompt will match.  Shorter same-session continued
+         * snapshots are strict pre-divergence prefixes and remain valuable.
+         * Only run the strict-prefix prune for continued and cold stores,
+         * where the new entry truly dominates its shorter siblings. */
+        if (strcmp(reason, "evict") != 0 && strcmp(reason, "shutdown") != 0) {
+            kv_cache_prune_supersedes(kc, text, text_len, sha);
+        }
         kv_cache_evict(kc, live_tokens, sha);
     }
     free(tmp);
@@ -14807,6 +14864,7 @@ static void test_kv_stub_file(const char *dir, const char *sha,
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
+                                   uint8_t reason,
                                    uint32_t tokens, uint64_t payload_bytes) {
     char sha[41];
     sha1_bytes_hex(text, strlen(text), sha);
@@ -14821,7 +14879,7 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    kv_fill_header(h, 2, KV_REASON_COLD, 0, tokens, 0, 32768, 100, 100, payload_bytes);
+    kv_fill_header(h, 2, reason, 0, tokens, 0, 32768, 100, 100, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -14842,8 +14900,8 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
 
     const char *short_text = "transcript prefix";
     const char *long_text = "transcript prefix with sampled token bytes";
-    test_kv_text_stub_file(dir, short_text, 512, 0);
-    test_kv_text_stub_file(dir, long_text, 768, 0);
+    test_kv_text_stub_file(dir, short_text, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file(dir, long_text, KV_REASON_COLD, 768, 0);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -15114,6 +15172,147 @@ static void test_kv_cache_eviction_does_not_protect_oversize_current_store(void)
     unlink(new_path);
     free(old_path);
     free(new_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_prune_supersedes_unlinks_strict_prefix(void) {
+    char tmpl[] = "/tmp/ds4-kv-supersede-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *short_text = "system: hello world";
+    const char *long_text  = "system: hello world\nuser: prompt";
+    test_kv_text_stub_file(dir, short_text, KV_REASON_CONTINUED, 10, 1024);
+    test_kv_text_stub_file(dir, long_text,  KV_REASON_CONTINUED, 20, 2048);
+
+    char short_sha[41], long_sha[41];
+    sha1_bytes_hex(short_text, strlen(short_text), short_sha);
+    sha1_bytes_hex(long_text,  strlen(long_text),  long_sha);
+    char short_name[44], long_name[44];
+    snprintf(short_name, sizeof(short_name), "%.40s.kv", short_sha);
+    snprintf(long_name,  sizeof(long_name),  "%.40s.kv", long_sha);
+    char *short_path = path_join(dir, short_name);
+    char *long_path  = path_join(dir, long_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (uint64_t)1 << 30;
+    kv_cache_prune_supersedes(&kc, long_text, strlen(long_text), long_sha);
+
+    TEST_ASSERT(access(short_path, F_OK) != 0);
+    TEST_ASSERT(access(long_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(short_path);
+    unlink(long_path);
+    free(short_path);
+    free(long_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_prune_supersedes_keeps_unrelated(void) {
+    char tmpl[] = "/tmp/ds4-kv-supersede-keep-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *unrelated_text = "different workload entirely";
+    const char *new_text       = "system: hello world\nuser: prompt";
+    test_kv_text_stub_file(dir, unrelated_text, KV_REASON_CONTINUED, 8, 512);
+
+    char unrelated_sha[41], new_sha[41];
+    sha1_bytes_hex(unrelated_text, strlen(unrelated_text), unrelated_sha);
+    sha1_bytes_hex(new_text,       strlen(new_text),       new_sha);
+    char unrelated_name[44];
+    snprintf(unrelated_name, sizeof(unrelated_name), "%.40s.kv", unrelated_sha);
+    char *unrelated_path = path_join(dir, unrelated_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (uint64_t)1 << 30;
+    kv_cache_prune_supersedes(&kc, new_text, strlen(new_text), new_sha);
+
+    TEST_ASSERT(access(unrelated_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(unrelated_path);
+    free(unrelated_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_prune_supersedes_skips_self(void) {
+    char tmpl[] = "/tmp/ds4-kv-supersede-self-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *new_text = "system: hello world";
+    test_kv_text_stub_file(dir, new_text, KV_REASON_CONTINUED, 10, 1024);
+
+    char new_sha[41];
+    sha1_bytes_hex(new_text, strlen(new_text), new_sha);
+    char new_name[44];
+    snprintf(new_name, sizeof(new_name), "%.40s.kv", new_sha);
+    char *new_path = path_join(dir, new_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (uint64_t)1 << 30;
+    kv_cache_prune_supersedes(&kc, new_text, strlen(new_text), new_sha);
+
+    TEST_ASSERT(access(new_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(new_path);
+    free(new_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_prune_supersedes_keeps_cold_checkpoint(void) {
+    char tmpl[] = "/tmp/ds4-kv-supersede-cold-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* The short entry is a cold checkpoint (e.g. an anchor-user cut at the
+     * system-prompt boundary).  A longer same-prefix snapshot must not delete
+     * it; conversations that diverge past the short prefix still need it. */
+    const char *short_text = "system: hello world";
+    const char *long_text  = "system: hello world\nuser: prompt";
+    test_kv_text_stub_file(dir, short_text, KV_REASON_COLD,      10, 1024);
+    test_kv_text_stub_file(dir, long_text,  KV_REASON_CONTINUED, 20, 2048);
+
+    char short_sha[41], long_sha[41];
+    sha1_bytes_hex(short_text, strlen(short_text), short_sha);
+    sha1_bytes_hex(long_text,  strlen(long_text),  long_sha);
+    char short_name[44], long_name[44];
+    snprintf(short_name, sizeof(short_name), "%.40s.kv", short_sha);
+    snprintf(long_name,  sizeof(long_name),  "%.40s.kv", long_sha);
+    char *short_path = path_join(dir, short_name);
+    char *long_path  = path_join(dir, long_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (uint64_t)1 << 30;
+    kv_cache_prune_supersedes(&kc, long_text, strlen(long_text), long_sha);
+
+    TEST_ASSERT(access(short_path, F_OK) == 0);
+    TEST_ASSERT(access(long_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(short_path);
+    unlink(long_path);
+    free(short_path);
+    free(long_path);
     rmdir(dir);
 }
 
@@ -15561,6 +15760,10 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_protects_current_store();
     test_kv_cache_eviction_does_not_protect_oversize_current_store();
+    test_kv_cache_prune_supersedes_unlinks_strict_prefix();
+    test_kv_cache_prune_supersedes_keeps_unrelated();
+    test_kv_cache_prune_supersedes_skips_self();
+    test_kv_cache_prune_supersedes_keeps_cold_checkpoint();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
