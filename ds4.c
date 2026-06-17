@@ -11236,8 +11236,13 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
     const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
-    const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
-    const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
+    /* GLM's first DS4_N_FIRST_K_DENSE layers are dense (no shared/routed expert
+     * tensors), so size the MoE work buffers from the first routed layer. */
+    const ds4_layer_weights *moe_layer = layer;
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM && DS4_N_FIRST_K_DENSE < DS4_N_LAYER)
+        moe_layer = &weights->layer[DS4_N_FIRST_K_DENSE];
+    const uint64_t shared_dim = moe_layer->ffn_gate_shexp->dim[1];
+    const uint64_t routed_mid_dim = moe_layer->ffn_gate_exps->dim[1];
     const uint64_t vocab_dim = weights->output ? weights->output->dim[1] : DS4_N_VOCAB;
     const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
         ? DS4_N_HEAD_DIM
@@ -15071,6 +15076,155 @@ static bool metal_graph_profile_router_selection(
     return true;
 }
 
+/* GLM MoE router on the CPU: sigmoid noaux_tc scoring + flat top-8 + normalized
+ * weights x routed_scaling_factor.  Reuses the validated CPU router and writes
+ * the selection into the GPU tensors the routed-MoE kernel reads.  The router is
+ * tiny (one token, 256 experts), so the per-MoE-layer sync is cheap for v1; a
+ * fused sigmoid Metal router can replace it later. */
+static bool metal_graph_glm_cpu_router(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer) {
+    if (ds4_gpu_end_commands() == 0) return false;
+    if (ds4_gpu_tensor_read(g->ffn_norm, 0, g->cpu_router_norm,
+                            (uint64_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0])) == 0) {
+        return false;
+    }
+
+    int selected[DS4_MAX_EXPERT_USED];
+    int32_t selected_i32[DS4_MAX_EXPERT_USED];
+    float weights[DS4_MAX_EXPERT_USED];
+    layer_topk_selected_experts(selected, weights, model, layer, g->cpu_router_norm);
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) selected_i32[i] = (int32_t)selected[i];
+
+    if (ds4_gpu_tensor_write(g->router_selected, 0, selected_i32,
+                             (uint64_t)DS4_N_EXPERT_USED * sizeof(selected_i32[0])) == 0 ||
+        ds4_gpu_tensor_write(g->router_weights, 0, weights,
+                             (uint64_t)DS4_N_EXPERT_USED * sizeof(weights[0])) == 0) {
+        return false;
+    }
+    if (ds4_gpu_begin_commands() == 0) return false;
+    if (ds4_gpu_routed_moe_set_selected_override(selected_i32, DS4_N_EXPERT_USED) == 0) return false;
+    return true;
+}
+
+/* GLM-5.2 single-token decode layer.  GLM has no Hyper-Connections (single
+ * residual stream, cur_hc is [n_embd]), no KV compression, and no indexer, so
+ * this is a flat sequence rather than the DeepSeek fused/streaming path: plain
+ * RMSNorm for hc_pre, plain residual add for hc_post, absorbed 576-key/512-value
+ * attention with no sinks (scale 1/sqrt(256)) and no inverse rope on the value,
+ * a plain o_proj, dense SwiGLU for the first DS4_N_FIRST_K_DENSE layers, and
+ * sigmoid-routed MoE + shared expert otherwise.  Mirrors layer_forward_self_one
+ * on the CPU. */
+static bool metal_graph_encode_decode_layer_glm(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        ds4_gpu_tensor       *raw_cache,
+        uint32_t                raw_cap,
+        uint32_t                raw_row,
+        uint32_t                n_raw,
+        int                     token) {
+    (void)token;
+    const uint64_t q_rank = layer->attn_q_a->dim[1];
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;       /* 64*576 */
+    const uint32_t value_heads_dim = (uint32_t)DS4_N_HEAD * DS4_N_VALUE_DIM; /* 64*512 -> o_proj input */
+    const float freq_base = layer_rope_freq_base(il);
+    const float freq_scale = layer_rope_freq_scale(il);
+    const float kq_scale = 1.0f / sqrtf(256.0f);
+    const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
+    bool ok = true;
+
+    /* hc_pre (attn): GLM bypasses HC, so the sublayer input is RMSNorm(residual)
+     * and the residual itself is cur_hc. */
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm, g->cur_hc, model->map, model->size,
+                                                layer->attn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    /* Q: down-proj -> q_a RMSNorm -> up-proj -> per-head RMSNorm -> rope tail. */
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size, layer->attn_q_a->abs_offset,
+                                            DS4_N_EMBD, q_rank, g->attn_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->qr_norm, g->qr, model->map, model->size,
+                                                layer->attn_q_a_norm->abs_offset, (uint32_t)q_rank, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size, layer->attn_q_b->abs_offset,
+                                            q_rank, q_dim, g->qr_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, 0, false,
+                                          freq_base, freq_scale, 0.0f, 1.0f,
+                                          DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+    /* KV: project the 576 latent, RMSNorm only the first n_value_dim (c_kv) and
+     * leave the decoupled rope tail raw, rope the tail, store FP8 to the cache. */
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv, model->map, model->size, layer->attn_kv->abs_offset,
+                                            DS4_N_EMBD, DS4_N_HEAD_DIM, g->attn_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->kv, g->kv, model->map, model->size,
+                                                layer->attn_kv_a_norm->abs_offset, DS4_N_VALUE_DIM, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_rope_tail_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, 0, false,
+                                          freq_base, freq_scale, 0.0f, 1.0f,
+                                          DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+    if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
+    /* Attention: 576-wide key, 512-wide rope-free value, no sinks.  No inverse
+     * rope on the heads (the value context is the rope-free c_kv). */
+    if (ok) ok = ds4_gpu_attention_decode_heads_glm_tensor(g->heads, g->q, raw_cache, n_raw, raw_cap, raw_start,
+                                                           DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, kq_scale) != 0;
+    /* Plain absorbed output projection [n_head*n_value_dim -> n_embd]. */
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->attn_out, model->map, model->size, layer->attn_output->abs_offset,
+                                            value_heads_dim, DS4_N_EMBD, g->heads, 1) != 0;
+    /* hc_post (attn): plain residual add. */
+    if (ok) ok = ds4_gpu_add_tensor(g->after_attn_hc, g->attn_out, g->cur_hc, DS4_N_EMBD) != 0;
+
+    /* hc_pre (ffn): RMSNorm(after_attn_hc). */
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm, g->after_attn_hc, model->map, model->size,
+                                                layer->ffn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    if (il < DS4_N_FIRST_K_DENSE) {
+        /* Dense SwiGLU MLP (intermediate 12288).  Reuse the wider routed-MoE
+         * scratch (unused on dense layers) for gate/up/mid. */
+        const uint64_t dense_dim = layer->ffn_gate_dense->dim[1];
+        if (ok) ok = ds4_gpu_matmul_q8_0_pair_tensor(g->routed_gate, g->routed_up, model->map, model->size,
+                                                     layer->ffn_gate_dense->abs_offset, layer->ffn_up_dense->abs_offset,
+                                                     DS4_N_EMBD, dense_dim, dense_dim, g->ffn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_swiglu_tensor(g->routed_mid, g->routed_gate, g->routed_up,
+                                           (uint32_t)dense_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->ffn_out, model->map, model->size, layer->ffn_down_dense->abs_offset,
+                                                dense_dim, DS4_N_EMBD, g->routed_mid, 1) != 0;
+    } else {
+        const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
+        const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+        const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+        const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+        const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+        const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+        const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+        const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+        const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+        /* Sigmoid noaux_tc routing on the CPU (writes router_selected/weights). */
+        if (ok) ok = metal_graph_glm_cpu_router(g, model, layer);
+        /* Shared expert (always on for MoE layers). */
+        if (ok) ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate, g->shared_up, g->shared_mid,
+                                                               model->map, model->size,
+                                                               layer->ffn_gate_shexp->abs_offset,
+                                                               layer->ffn_up_shexp->abs_offset,
+                                                               DS4_N_EMBD, shared_dim, g->ffn_norm,
+                                                               DS4_SWIGLU_CLAMP_EXP) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
+                                                layer->ffn_down_shexp->abs_offset,
+                                                shared_dim, DS4_N_EMBD, g->shared_mid, 1) != 0;
+        /* Routed experts (top-8). */
+        if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out, g->routed_gate, g->routed_up, g->routed_mid, g->routed_down,
+                                                   model->map, model->size,
+                                                   layer->ffn_gate_exps->abs_offset, layer->ffn_up_exps->abs_offset,
+                                                   layer->ffn_down_exps->abs_offset,
+                                                   layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+                                                   gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                                                   (uint32_t)expert_in_dim, (uint32_t)down_in_dim, (uint32_t)routed_out_dim,
+                                                   g->router_selected, g->router_weights, DS4_N_EXPERT,
+                                                   DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm, il) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
+    }
+    /* hc_post (ffn): plain residual add into the next residual stream. */
+    if (ok) ok = ds4_gpu_add_tensor(g->after_ffn_hc, g->ffn_out, g->after_attn_hc, DS4_N_EMBD) != 0;
+    return ok;
+}
+
 static bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15082,6 +15236,10 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        return metal_graph_encode_decode_layer_glm(g, model, layer, il, pos,
+                                                   raw_cache, raw_cap, raw_row, n_raw, token);
+    }
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -16305,6 +16463,19 @@ static bool metal_graph_encode_output_head(
         const ds4_model       *model,
         const ds4_weights     *weights,
         uint64_t               vocab_dim) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM has no output Hyper-Connections: cur_hc is already the single
+         * [n_embd] residual.  Final RMSNorm + vocab projection only. */
+        bool gok = ds4_gpu_rms_norm_weight_tensor(g->output_norm, g->cur_hc,
+                                                  model->map, model->size,
+                                                  weights->output_norm->abs_offset,
+                                                  DS4_N_EMBD, DS4_RMS_EPS) != 0;
+        if (gok) gok = ds4_gpu_matmul_q8_0_tensor(g->logits, model->map, model->size,
+                                                  weights->output->abs_offset,
+                                                  DS4_N_EMBD, vocab_dim,
+                                                  g->output_norm, 1) != 0;
+        return gok;
+    }
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->output_pre,

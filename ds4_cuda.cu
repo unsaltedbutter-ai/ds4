@@ -8634,6 +8634,25 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
             0, 0, ratio);
     return cuda_ok(cudaGetLastError(), "compressor state set launch");
 }
+/* GLM-5.2 absorbed-MLA decode attention runs on the Metal backend only; this
+ * stub keeps the CUDA build linking (GLM on CUDA is unsupported and untested). */
+extern "C" int ds4_gpu_attention_decode_heads_glm_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_head,
+        uint32_t                key_dim,
+        uint32_t                value_dim,
+        float                   kq_scale) {
+    (void)heads; (void)q; (void)raw_kv; (void)n_raw; (void)raw_cap; (void)raw_start;
+    (void)n_head; (void)key_dim; (void)value_dim; (void)kq_scale;
+    fprintf(stderr, "ds4: GLM decode attention is not supported on the CUDA backend\n");
+    return 0;
+}
+
 extern "C" int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

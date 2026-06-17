@@ -595,6 +595,20 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+/* GLM-5.2 absorbed-MLA decode attention: key_dim-wide latent key (c_kv + rope),
+ * value_dim-wide rope-free value, no sinks, score scale kq_scale. */
+int ds4_gpu_attention_decode_heads_glm_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_head,
+        uint32_t                key_dim,
+        uint32_t                value_dim,
+        float                   kq_scale);
+
 int ds4_gpu_attention_prefill_raw_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
