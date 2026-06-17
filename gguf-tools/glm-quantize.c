@@ -368,6 +368,145 @@ static void read_tensor_cmd(const stdb *db, const char *name) {
 }
 
 /* =====
+ * GGUF writer. Metadata is authored directly from GLM's config per the schema
+ * contract in glm-port-plan.md sec 5c (these `deepseek4.*` values MUST match the
+ * DS4_SHAPE_GLM constants the engine will validate against). Tensor data is added
+ * incrementally; this milestone emits metadata + 0 tensors.
+ */
+enum {
+    GT_U8 = 0, GT_I8, GT_U16, GT_I16, GT_U32, GT_I32, GT_F32,
+    GT_BOOL, GT_STR, GT_ARR, GT_U64, GT_I64, GT_F64
+};
+#define GGUF_MAGIC   0x46554747u  /* "GGUF" little-endian */
+#define GGUF_VERSION 3u
+
+typedef struct { uint8_t *d; size_t n, cap; } buf;
+static void bput(buf *b, const void *p, size_t n) {
+    if (b->n + n > b->cap) {
+        b->cap = b->cap ? b->cap : 4096;
+        while (b->cap < b->n + n) b->cap *= 2;
+        b->d = xrealloc(b->d, b->cap);
+    }
+    memcpy(b->d + b->n, p, n);
+    b->n += n;
+}
+static void b_u32(buf *b, uint32_t v) { bput(b, &v, 4); }
+static void b_u64(buf *b, uint64_t v) { bput(b, &v, 8); }
+static void b_str(buf *b, const char *s) { uint64_t n = strlen(s); b_u64(b, n); if (n) bput(b, s, n); }
+
+static void kv_str (buf *b, int *nk, const char *k, const char *v) { b_str(b,k); b_u32(b,GT_STR);  b_str(b,v); (*nk)++; }
+static void kv_u32 (buf *b, int *nk, const char *k, uint32_t v)    { b_str(b,k); b_u32(b,GT_U32);  b_u32(b,v); (*nk)++; }
+static void kv_f32 (buf *b, int *nk, const char *k, float v)       { b_str(b,k); b_u32(b,GT_F32);  bput(b,&v,4); (*nk)++; }
+static void kv_bool(buf *b, int *nk, const char *k, int v)         { b_str(b,k); b_u32(b,GT_BOOL); uint8_t u=v?1:0; bput(b,&u,1); (*nk)++; }
+static void kv_arr_u32(buf *b, int *nk, const char *k, const uint32_t *v, uint64_t n) {
+    b_str(b,k); b_u32(b,GT_ARR); b_u32(b,GT_U32); b_u64(b,n);
+    for (uint64_t i=0;i<n;i++) b_u32(b,v[i]); (*nk)++;
+}
+static void kv_arr_f32(buf *b, int *nk, const char *k, const float *v, uint64_t n) {
+    b_str(b,k); b_u32(b,GT_ARR); b_u32(b,GT_F32); b_u64(b,n);
+    for (uint64_t i=0;i<n;i++) bput(b,&v[i],4); (*nk)++;
+}
+
+/* GLM nominal float constants (must equal DS4_SHAPE_GLM). YaRN/compression/HC are
+ * off for GLM, so their bases/epsilons are nominal placeholders. */
+#define GLM_ROPE_FREQ_BASE      8000000.0f
+#define GLM_ROPE_SCALE_FACTOR   1.0f
+#define GLM_YARN_BETA_FAST      1.0f
+#define GLM_YARN_BETA_SLOW      1.0f
+#define GLM_COMPRESS_ROPE_BASE  8000000.0f
+#define GLM_EXPERT_WEIGHT_SCALE 2.5f
+#define GLM_RMS_EPS             1e-5f
+#define GLM_HC_EPS              1e-5f
+#define GLM_SWIGLU_CLAMP_EXP    30.0f   /* large => effectively no clamp (GLM plain SwiGLU) */
+
+static void emit_metadata(buf *kv, int *nk) {
+    kv_str (kv, nk, "general.architecture", "deepseek4");  /* ds4 does not validate this */
+    kv_str (kv, nk, "general.name", "GLM-5.2");
+    kv_u32 (kv, nk, "deepseek4.block_count", GLM_N_LAYER);
+    kv_u32 (kv, nk, "deepseek4.embedding_length", 6144);
+    kv_u32 (kv, nk, "deepseek4.vocab_size", 154880);
+    kv_u32 (kv, nk, "deepseek4.attention.head_count", 64);
+    kv_u32 (kv, nk, "deepseek4.attention.head_count_kv", 1);
+    kv_u32 (kv, nk, "deepseek4.attention.key_length", 576);   /* 512 c_kv + 64 rope (absorbed) */
+    kv_u32 (kv, nk, "deepseek4.attention.value_length", 512); /* value = c_kv only */
+    kv_u32 (kv, nk, "deepseek4.rope.dimension_count", 64);
+    kv_u32 (kv, nk, "deepseek4.attention.q_lora_rank", 2048);
+    kv_u32 (kv, nk, "deepseek4.attention.output_lora_rank", 0);    /* sentinel: plain o_proj */
+    kv_u32 (kv, nk, "deepseek4.attention.output_group_count", 1);  /* sentinel */
+    kv_u32 (kv, nk, "deepseek4.expert_count", GLM_N_EXPERT);
+    kv_u32 (kv, nk, "deepseek4.expert_used_count", 8);
+    kv_u32 (kv, nk, "deepseek4.expert_feed_forward_length", 2048);
+    kv_u32 (kv, nk, "deepseek4.expert_shared_count", 1);
+    kv_u32 (kv, nk, "deepseek4.hash_layer_count", 0);
+    kv_u32 (kv, nk, "deepseek4.first_k_dense_count", GLM_FIRST_K_DENSE);  /* NEW key for GLM */
+    kv_u32 (kv, nk, "deepseek4.attention.sliding_window", 0);   /* TBD: full-attention KV sizing */
+    kv_u32 (kv, nk, "deepseek4.attention.indexer.head_count", 32);
+    kv_u32 (kv, nk, "deepseek4.attention.indexer.key_length", 128);
+    kv_u32 (kv, nk, "deepseek4.attention.indexer.top_k", 2048);
+    kv_u32 (kv, nk, "deepseek4.hyper_connection.count", 1);            /* HC bypassed */
+    kv_u32 (kv, nk, "deepseek4.hyper_connection.sinkhorn_iterations", 0);
+    kv_f32 (kv, nk, "deepseek4.rope.freq_base", GLM_ROPE_FREQ_BASE);
+    kv_f32 (kv, nk, "deepseek4.rope.scaling.factor", GLM_ROPE_SCALE_FACTOR);
+    kv_f32 (kv, nk, "deepseek4.rope.scaling.yarn_beta_fast", GLM_YARN_BETA_FAST);
+    kv_f32 (kv, nk, "deepseek4.rope.scaling.yarn_beta_slow", GLM_YARN_BETA_SLOW);
+    kv_f32 (kv, nk, "deepseek4.attention.compress_rope_freq_base", GLM_COMPRESS_ROPE_BASE);
+    kv_f32 (kv, nk, "deepseek4.expert_weights_scale", GLM_EXPERT_WEIGHT_SCALE);
+    kv_f32 (kv, nk, "deepseek4.attention.layer_norm_rms_epsilon", GLM_RMS_EPS);
+    kv_f32 (kv, nk, "deepseek4.hyper_connection.epsilon", GLM_HC_EPS);
+    kv_bool(kv, nk, "deepseek4.expert_weights_norm", 1);
+    uint32_t cr[GLM_N_LAYER]; for (int i=0;i<GLM_N_LAYER;i++) cr[i]=0;
+    kv_arr_u32(kv, nk, "deepseek4.attention.compress_ratios", cr, GLM_N_LAYER);
+    float sc[GLM_N_LAYER]; for (int i=0;i<GLM_N_LAYER;i++) sc[i]=GLM_SWIGLU_CLAMP_EXP;
+    kv_arr_f32(kv, nk, "deepseek4.swiglu_clamp_exp", sc, GLM_N_LAYER);
+}
+
+static void write_gguf_meta(const char *out) {
+    buf kv = {0};
+    int nk = 0;
+    emit_metadata(&kv, &nk);
+    FILE *f = fopen(out, "wb");
+    if (!f) die("cannot open output gguf");
+    uint32_t magic = GGUF_MAGIC, ver = GGUF_VERSION;
+    uint64_t n_tensors = 0, n_kv = (uint64_t)nk;
+    fwrite(&magic, 4, 1, f); fwrite(&ver, 4, 1, f);
+    fwrite(&n_tensors, 8, 1, f); fwrite(&n_kv, 8, 1, f);
+    fwrite(kv.d, 1, kv.n, f);
+    fclose(f);
+    free(kv.d);
+    printf("wrote %s: %d KV records, 0 tensors, %zu metadata bytes\n", out, nk, kv.n);
+}
+
+/* Minimal GGUF reader for --verify: lists KV keys, confirms structural validity. */
+static uint32_t r_u32(FILE *f){ uint32_t v; if(fread(&v,4,1,f)!=1) die("read u32"); return v; }
+static uint64_t r_u64(FILE *f){ uint64_t v; if(fread(&v,8,1,f)!=1) die("read u64"); return v; }
+static char *r_str(FILE *f){ uint64_t n=r_u64(f); char *s=xmalloc(n+1); if(n&&fread(s,1,n,f)!=n) die("read str"); s[n]='\0'; return s; }
+static size_t gguf_scalar_size(uint32_t t){
+    switch(t){ case GT_U8: case GT_I8: case GT_BOOL: return 1;
+               case GT_U16: case GT_I16: return 2;
+               case GT_U32: case GT_I32: case GT_F32: return 4;
+               case GT_U64: case GT_I64: case GT_F64: return 8; default: return 0; }
+}
+static void skip_value(FILE *f, uint32_t t){
+    if (t==GT_STR){ uint64_t n=r_u64(f); if(fseeko(f,(off_t)n,SEEK_CUR)) die("seek"); return; }
+    if (t==GT_ARR){ uint32_t et=r_u32(f); uint64_t n=r_u64(f);
+        if (et==GT_STR){ for(uint64_t i=0;i<n;i++){ uint64_t l=r_u64(f); if(fseeko(f,(off_t)l,SEEK_CUR)) die("seek"); } return; }
+        size_t s=gguf_scalar_size(et); if(!s) die("bad array elem type");
+        if(fseeko(f,(off_t)(s*n),SEEK_CUR)) die("seek"); return; }
+    size_t s=gguf_scalar_size(t); if(!s) die("bad value type");
+    if(fseeko(f,(off_t)s,SEEK_CUR)) die("seek");
+}
+static void verify_gguf(const char *path){
+    FILE *f=fopen(path,"rb"); if(!f) die("open gguf");
+    uint32_t magic=r_u32(f), ver=r_u32(f);
+    uint64_t nt=r_u64(f), nk=r_u64(f);
+    printf("magic=%.4s version=%u n_tensors=%llu n_kv=%llu\n",
+           (char*)&magic, ver, (unsigned long long)nt, (unsigned long long)nk);
+    if (magic != GGUF_MAGIC) die("not a GGUF file");
+    for (uint64_t i=0;i<nk;i++){ char *k=r_str(f); uint32_t t=r_u32(f); printf("  %s\n", k); free(k); skip_value(f,t); }
+    fclose(f);
+}
+
+/* =====
  * --dry-run: converter coverage map.
  */
 typedef enum { CLASS_MAPPED, CLASS_ABSORB, CLASS_SKIP } map_class;
@@ -459,28 +598,35 @@ static void dry_run_report(const stdb *db) {
 
 static void usage(void) {
     fprintf(stderr,
-        "usage: glm-quantize --hf <dir> [--dry-run | --read <tensor>]\n"
+        "usage: glm-quantize [--hf <dir>] [--dry-run | --read <tensor> | --write-gguf <out> | --verify <gguf>]\n"
         "  --hf <dir>        directory with GLM-5.2 model-*.safetensors shards\n"
         "  --dry-run         scan shard headers and report converter coverage (default)\n"
-        "  --read <tensor>   read one HF tensor, dequantize to f32, print shape + stats\n");
+        "  --read <tensor>   read one HF tensor, dequantize to f32, print shape + stats\n"
+        "  --write-gguf <o>  author a GLM GGUF (metadata only for now) to <o>\n"
+        "  --verify <gguf>   read back a GGUF header and list its metadata keys\n");
     exit(1);
 }
 
 int main(int argc, char **argv) {
-    const char *hf_dir = NULL, *read_name = NULL;
+    const char *hf_dir = NULL, *read_name = NULL, *write_out = NULL, *verify_in = NULL;
     bool dry_run = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--hf") == 0 && i + 1 < argc) hf_dir = argv[++i];
         else if (strcmp(argv[i], "--read") == 0 && i + 1 < argc) read_name = argv[++i];
+        else if (strcmp(argv[i], "--write-gguf") == 0 && i + 1 < argc) write_out = argv[++i];
+        else if (strcmp(argv[i], "--verify") == 0 && i + 1 < argc) verify_in = argv[++i];
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) usage();
         else { fprintf(stderr, "glm-quantize: unknown arg: %s\n", argv[i]); usage(); }
     }
-    if (!hf_dir) usage();
 
+    /* Modes that do not need the safetensors set. */
+    if (verify_in) { verify_gguf(verify_in); return 0; }
+    if (write_out) { write_gguf_meta(write_out); return 0; }
+
+    if (!hf_dir) usage();
     stdb db;
     stdb_open(&db, hf_dir);
-
     if (read_name) read_tensor_cmd(&db, read_name);
     else { (void)dry_run; dry_run_report(&db); }
     return 0;
