@@ -646,12 +646,15 @@ static void write_gguf_meta(const char *out, const char *hf_dir) {
  * This iteration writes passthrough tensors (dequant bf16 -> quantize). Absorbed
  * attention (attn_q_b/attn_output) and stacked routed experts are TODO.
  */
+typedef enum { SRC_PASS, SRC_QB_ABSORB, SRC_O_ABSORB, SRC_EXPERT } src_kind;
 typedef struct {
     char name[192];
     ds4q_type type;
     int ndim;
     int64_t ne[4];
-    char hf[192];          /* passthrough source tensor name */
+    src_kind kind;
+    char hf[256];          /* PASS: source name; EXPERT: name template with one %d */
+    int layer;             /* for ABSORB / EXPERT */
     uint64_t offset, nbytes;
 } tplan;
 
@@ -661,14 +664,72 @@ static int64_t plan_nrows(const tplan *t) {
     return r;
 }
 
-static void plan_add(tplan **arr, int *n, int *cap, const char *name, ds4q_type type,
-                     int ndim, int64_t e0, int64_t e1, int64_t e2, const char *hf) {
+static tplan *plan_add(tplan **arr, int *n, int *cap, const char *name, ds4q_type type,
+                       int ndim, int64_t e0, int64_t e1, int64_t e2, const char *hf) {
     if (*n == *cap) { *cap = *cap ? *cap * 2 : 256; *arr = xrealloc(*arr, (size_t)*cap * sizeof(tplan)); }
     tplan *t = &(*arr)[(*n)++];
     memset(t, 0, sizeof(*t));
     snprintf(t->name, sizeof(t->name), "%s", name);
     t->type = type; t->ndim = ndim; t->ne[0]=e0; t->ne[1]=e1; t->ne[2]=e2;
+    t->kind = SRC_PASS; t->layer = -1;
     snprintf(t->hf, sizeof(t->hf), "%s", hf);
+    return t;
+}
+
+/* attn_q_b absorbed [out=64*576, in=2048]: per head, top 512 rows = W_UK_h^T @ q_b_nope_h,
+ * next 64 rows = q_b_rope_h. (See gguf-tools/check_mla_absorption.py — proven.) */
+static float *produce_qb_absorb(stdb *db, int L) {
+    char nm[256];
+    snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.q_b_proj.weight", L);
+    const gtensor *gq = stdb_find(db, nm); if (!gq) die("no q_b_proj");
+    snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.kv_b_proj.weight", L);
+    const gtensor *gk = stdb_find(db, nm); if (!gk) die("no kv_b_proj");
+    int64_t a=0,b=0;
+    float *qb = stdb_read_f32(db, gq, &a);    /* [16384,2048] */
+    float *kvb = stdb_read_f32(db, gk, &b);   /* [28672,512]  */
+    float *out = xcalloc((size_t)36864 * 2048, sizeof(float));
+    for (int h = 0; h < 64; h++) {
+        for (int m = 0; m < 192; m++) {
+            const float *uk = kvb + ((size_t)h*448 + m) * 512;   /* W_UK_h row m: [512] */
+            const float *qn = qb  + ((size_t)h*256 + m) * 2048;  /* q_b_nope_h row m: [2048] */
+            for (int l = 0; l < 512; l++) {
+                float av = uk[l];
+                float *orow = out + ((size_t)h*576 + l) * 2048;
+                for (int j = 0; j < 2048; j++) orow[j] += av * qn[j];
+            }
+        }
+        for (int r = 0; r < 64; r++)
+            memcpy(out + ((size_t)h*576 + 512 + r) * 2048,
+                   qb + ((size_t)h*256 + 192 + r) * 2048, 2048 * sizeof(float));
+    }
+    free(qb); free(kvb);
+    return out;
+}
+
+/* attn_output absorbed [out=6144, in=64*512]: per head, cols [h*512..] = o_proj_h @ W_UV_h. */
+static float *produce_o_absorb(stdb *db, int L) {
+    char nm[256];
+    snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.o_proj.weight", L);
+    const gtensor *go = stdb_find(db, nm); if (!go) die("no o_proj");
+    snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.kv_b_proj.weight", L);
+    const gtensor *gk = stdb_find(db, nm); if (!gk) die("no kv_b_proj");
+    int64_t a=0,b=0;
+    float *op = stdb_read_f32(db, go, &a);    /* [6144,16384] */
+    float *kvb = stdb_read_f32(db, gk, &b);   /* [28672,512]  */
+    float *out = xcalloc((size_t)6144 * 32768, sizeof(float));
+    for (int h = 0; h < 64; h++) {
+        for (int i = 0; i < 6144; i++) {
+            const float *opi = op + (size_t)i*16384 + (size_t)h*256;  /* [256] */
+            float *orow = out + (size_t)i*32768 + (size_t)h*512;       /* [512] */
+            for (int c = 0; c < 256; c++) {
+                float av = opi[c];
+                const float *uv = kvb + ((size_t)h*448 + 192 + c) * 512;  /* W_UV_h row c: [512] */
+                for (int l = 0; l < 512; l++) orow[l] += av * uv[l];
+            }
+        }
+    }
+    free(op); free(kvb);
+    return out;
 }
 
 static tplan *build_plan(int n_layers, int *count) {
@@ -686,6 +747,8 @@ static tplan *build_plan(int n_layers, int *count) {
         plan_add(&p,&n,&cap,NM("attn_q_a_norm.weight"), DS4Q_TYPE_F32, 1,2048,0,0,    HF("self_attn.q_a_layernorm.weight"));
         plan_add(&p,&n,&cap,NM("attn_kv.weight"),       DS4Q_TYPE_Q8_0,2,6144,576,0,  HF("self_attn.kv_a_proj_with_mqa.weight"));
         plan_add(&p,&n,&cap,NM("attn_kv_a_norm.weight"),DS4Q_TYPE_F32, 1,512,0,0,     HF("self_attn.kv_a_layernorm.weight"));
+        { tplan *t = plan_add(&p,&n,&cap,NM("attn_q_b.weight"),    DS4Q_TYPE_Q8_0,2,2048,36864,0,""); t->kind=SRC_QB_ABSORB; t->layer=L; }
+        { tplan *t = plan_add(&p,&n,&cap,NM("attn_output.weight"), DS4Q_TYPE_Q8_0,2,32768,6144,0,"");  t->kind=SRC_O_ABSORB;  t->layer=L; }
         if (L < GLM_FIRST_K_DENSE) {
             plan_add(&p,&n,&cap,NM("ffn_gate_dense.weight"),DS4Q_TYPE_Q8_0,2,6144,12288,0, HF("mlp.gate_proj.weight"));
             plan_add(&p,&n,&cap,NM("ffn_up_dense.weight"),  DS4Q_TYPE_Q8_0,2,6144,12288,0, HF("mlp.up_proj.weight"));
@@ -696,6 +759,13 @@ static tplan *build_plan(int n_layers, int *count) {
             plan_add(&p,&n,&cap,NM("ffn_gate_shexp.weight"),DS4Q_TYPE_Q8_0,2,6144,2048,0, HF("mlp.shared_experts.gate_proj.weight"));
             plan_add(&p,&n,&cap,NM("ffn_up_shexp.weight"),  DS4Q_TYPE_Q8_0,2,6144,2048,0, HF("mlp.shared_experts.up_proj.weight"));
             plan_add(&p,&n,&cap,NM("ffn_down_shexp.weight"),DS4Q_TYPE_Q8_0,2,2048,6144,0, HF("mlp.shared_experts.down_proj.weight"));
+            char tmpl[256];
+            snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.gate_proj.weight",L);
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_gate_exps.weight"),DS4Q_TYPE_Q8_0,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
+            snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.up_proj.weight",L);
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_up_exps.weight"),  DS4Q_TYPE_Q8_0,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
+            snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.down_proj.weight",L);
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_down_exps.weight"),DS4Q_TYPE_Q8_0,3,2048,6144,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
         }
         #undef NM
         #undef HF
@@ -744,41 +814,62 @@ static void write_gguf_full(const char *out, const char *hf_dir, int n_layers) {
     for (int i = 0; i < n; i++) {
         tplan *t = &plan[i];
         while (dpos < t->offset) { fputc(0, f); dpos++; }
-        const gtensor *g = stdb_find(&db, t->hf);
-        if (!g) { fprintf(stderr, "glm-quantize: missing source %s\n", t->hf); exit(1); }
-        int64_t nelem = 0;
-        float *src = stdb_read_f32(&db, g, &nelem);
-        int64_t nrows = plan_nrows(t), ncols = t->ne[0];
-        if (nelem != nrows * ncols) {
-            fprintf(stderr, "glm-quantize: %s size %lld != %lld*%lld\n",
-                    t->name, (long long)nelem, (long long)nrows, (long long)ncols);
-            exit(1);
-        }
-        if (t->type == DS4Q_TYPE_F32) {
-            fwrite(src, 4, (size_t)nelem, f);
-        } else if (t->type == DS4Q_TYPE_F16) {
-            uint16_t *d = xmalloc((size_t)nelem * 2);
-            ds4q_f32_to_f16_row(src, d, nelem);
-            fwrite(d, 2, (size_t)nelem, f); free(d);
-        } else {
-            void *dst = xmalloc(t->nbytes);
-            ds4q_quantize_init(t->type);
-            size_t got = ds4q_quantize_chunk(t->type, src, dst, 0, nrows, ncols, NULL);
-            if (got != t->nbytes) {
-                fprintf(stderr, "glm-quantize: %s quant %zu != %llu\n",
-                        t->name, got, (unsigned long long)t->nbytes);
-                exit(1);
+        int64_t ncols = t->ne[0];
+        ds4q_quantize_init(t->type);
+
+        if (t->kind == SRC_EXPERT) {
+            /* stream 256 experts: the full stacked tensor is too big to hold in RAM */
+            int64_t per_rows = t->ne[1];
+            size_t rs = ds4q_row_size(t->type, ncols);
+            for (int E = 0; E < (int)t->ne[2]; E++) {
+                char nm[256]; snprintf(nm, sizeof(nm), t->hf, E);
+                const gtensor *g = stdb_find(&db, nm);
+                if (!g) { fprintf(stderr, "glm-quantize: missing %s\n", nm); exit(1); }
+                int64_t ne = 0; float *src = stdb_read_f32(&db, g, &ne);
+                if (ne != per_rows * ncols) { fprintf(stderr, "glm-quantize: %s size mismatch\n", nm); exit(1); }
+                void *dst = xmalloc(rs * (size_t)per_rows);
+                size_t got = ds4q_quantize_chunk(t->type, src, dst, 0, per_rows, ncols, NULL);
+                fwrite(dst, 1, got, f); dpos += got;
+                free(dst); free(src);
             }
-            fwrite(dst, 1, got, f); free(dst);
+        } else {
+            float *src;
+            int64_t nrows = plan_nrows(t);
+            if (t->kind == SRC_QB_ABSORB)     src = produce_qb_absorb(&db, t->layer);
+            else if (t->kind == SRC_O_ABSORB) src = produce_o_absorb(&db, t->layer);
+            else {
+                const gtensor *g = stdb_find(&db, t->hf);
+                if (!g) { fprintf(stderr, "glm-quantize: missing source %s\n", t->hf); exit(1); }
+                int64_t ne = 0; src = stdb_read_f32(&db, g, &ne);
+                if (ne != nrows * ncols) {
+                    fprintf(stderr, "glm-quantize: %s size %lld != %lld*%lld\n",
+                            t->name, (long long)ne, (long long)nrows, (long long)ncols);
+                    exit(1);
+                }
+            }
+            if (t->type == DS4Q_TYPE_F32) {
+                fwrite(src, 4, (size_t)(nrows*ncols), f); dpos += (uint64_t)nrows*ncols*4;
+            } else if (t->type == DS4Q_TYPE_F16) {
+                uint16_t *d = xmalloc((size_t)(nrows*ncols) * 2);
+                ds4q_f32_to_f16_row(src, d, nrows*ncols);
+                fwrite(d, 2, (size_t)(nrows*ncols), f); dpos += (uint64_t)nrows*ncols*2; free(d);
+            } else {
+                void *dst = xmalloc(t->nbytes);
+                size_t got = ds4q_quantize_chunk(t->type, src, dst, 0, nrows, ncols, NULL);
+                if (got != t->nbytes) {
+                    fprintf(stderr, "glm-quantize: %s quant %zu != %llu\n",
+                            t->name, got, (unsigned long long)t->nbytes);
+                    exit(1);
+                }
+                fwrite(dst, 1, got, f); dpos += got; free(dst);
+            }
+            free(src);
         }
-        dpos += t->nbytes;
-        free(src);
         if ((i % 100) == 0 || i == n - 1)
             fprintf(stderr, "  [%d/%d] %s\n", i + 1, n, t->name);
     }
     fclose(f);
-    printf("wrote %s: %d tensors, %d KV, %d layers (NOTE: attn_q_b/attn_output/experts still TODO)\n",
-           out, n, nk, n_layers);
+    printf("wrote %s: %d tensors, %d KV, %d layers\n", out, n, nk, n_layers);
     free(plan);
 }
 
