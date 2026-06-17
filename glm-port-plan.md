@@ -549,6 +549,32 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (**Metal decode forward VALIDATED end-to-end vs CPU on the real Q2 model**): The GLM
+  single-token Metal graph now runs all 78 layers and matches the validated CPU forward. Natural
+  (non-teacher-forced) `--metal-graph-full-test` on `glm-5.2-q2.gguf`: **gpu_top == cpu_top == 154822**
+  (`[gMASK]`, the expected sequence-start prediction), gpu_top_logit 27.1895 vs cpu 27.1943, logits
+  max-diff 0.053 / rms 0.011. Teacher-forced per-layer diffs are ~1e-4 (early dense layers) growing to
+  ~0.4-0.6 max in the last layers (accumulated quant + GPU/CPU reduction-order noise; small vs the
+  residual magnitude). **On the GPU:** HC bypass (single residual stream), 576/512 absorbed MLA
+  attention (no sinks, kq_scale 1/√256, plain o_proj, partial kv_a_norm, no inverse-rope on the value),
+  dense SwiGLU for `il<3`, shared expert, output head (HC-collapse skipped). **On the CPU (v1 stopgap):**
+  the routed MoE — the Metal routed-MoE path is hardwired to 6 experts/token (`selected_ids[6]`, `sum6`
+  down-reduction kernels) and GLM routes 8, so `metal_graph_glm_cpu_routed_moe` runs the validated CPU
+  routed MoE and uploads the result. **An 8-expert Metal routed MoE (new `sum8` kernels + dispatch) is
+  now the main remaining speed item** (experts are ~97% of FLOPs). New kernel:
+  `kernel_flash_attn_ext_vec_f16_dk576_dv512` (NE=2 → NL=16 divides DK4=144; DK 576 is not a multiple of
+  128). **Real bugs found + fixed this session:** (1) `DS4_MAX_LAYER` 61→78 — GLM's 78 layers overflowed
+  `ds4_weights.layer[]` into following `ds4_engine` members; the prior "validated" CPU forward had been
+  running on UB (benign only because the clobbered MTP/backend fields were unread). (2)
+  `ds4_gpu_tensor_alloc(0)` returned NULL → now a minimal placeholder, so GLM's disabled-feature scratch
+  (`n_lora_o=0`, `compress_ratio=0` → zero-size attn_low/compressor/indexer buffers) allocates. (3)
+  routed-MoE selected-override capped at 6 → 8. (4) `metal_graph_alloc` sized MoE work buffers from the
+  dense layer[0] (NULL expert tensors for GLM) → now from the first routed layer. Validation workflow:
+  prod server (port 8085) stopped via `setup-launchagents-tts.sh --stop jumbo_server` (needs `bash -lc`
+  for brew PATH), test run with `-c 2048` so graph buffers fit under the 240 GB wired limit alongside the
+  224 GB model, server restarted (`--start jumbo_server`) after. Diagnostics left in place: a `GLM_STEP`
+  label macro in the GLM decode layer and stage-failure prints in the full-test loop (both fire only on
+  failure). DeepSeek/CUDA paths untouched; CUDA carries a stub for the new GLM attention entry point.
 - 2026-06-17 (Metal port begun): **Reverse-engineered the decode-path Metal graph and wrote the
   code-grounded implementation spec (§7c).** Confirmed the per-layer Metal flow lives in
   `metal_graph_encode_decode_layer` (ds4.c:15074, ~1230 lines of HC-fusion + expert-streaming
