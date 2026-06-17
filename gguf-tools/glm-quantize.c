@@ -28,6 +28,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "quants.h"
+
 /* GLM-5.2 shape, from config.json (see glm-port-plan.md sec 1). Hardcoded here
  * for now; the real converter will read these from config.json. */
 #define GLM_N_LAYER       78
@@ -499,6 +501,7 @@ static void kv_arr_i32(buf *b, int *nk, const char *k, const int32_t *v, uint64_
 static void emit_metadata(buf *kv, int *nk) {
     kv_str (kv, nk, "general.architecture", "deepseek4");  /* ds4 does not validate this */
     kv_str (kv, nk, "general.name", "GLM-5.2");
+    kv_u32 (kv, nk, "general.alignment", 32);
     kv_u32 (kv, nk, "deepseek4.block_count", GLM_N_LAYER);
     kv_u32 (kv, nk, "deepseek4.embedding_length", 6144);
     kv_u32 (kv, nk, "deepseek4.vocab_size", 154880);
@@ -638,6 +641,147 @@ static void write_gguf_meta(const char *out, const char *hf_dir) {
     printf("wrote %s: %d KV records, 0 tensors, %zu metadata bytes\n", out, nk, kv.n);
 }
 
+/* =====
+ * Tensor-data writer: GGUF tensor directory + 32-byte-aligned data section.
+ * This iteration writes passthrough tensors (dequant bf16 -> quantize). Absorbed
+ * attention (attn_q_b/attn_output) and stacked routed experts are TODO.
+ */
+typedef struct {
+    char name[192];
+    ds4q_type type;
+    int ndim;
+    int64_t ne[4];
+    char hf[192];          /* passthrough source tensor name */
+    uint64_t offset, nbytes;
+} tplan;
+
+static int64_t plan_nrows(const tplan *t) {
+    int64_t r = 1;
+    for (int i = 1; i < t->ndim; i++) r *= t->ne[i];
+    return r;
+}
+
+static void plan_add(tplan **arr, int *n, int *cap, const char *name, ds4q_type type,
+                     int ndim, int64_t e0, int64_t e1, int64_t e2, const char *hf) {
+    if (*n == *cap) { *cap = *cap ? *cap * 2 : 256; *arr = xrealloc(*arr, (size_t)*cap * sizeof(tplan)); }
+    tplan *t = &(*arr)[(*n)++];
+    memset(t, 0, sizeof(*t));
+    snprintf(t->name, sizeof(t->name), "%s", name);
+    t->type = type; t->ndim = ndim; t->ne[0]=e0; t->ne[1]=e1; t->ne[2]=e2;
+    snprintf(t->hf, sizeof(t->hf), "%s", hf);
+}
+
+static tplan *build_plan(int n_layers, int *count) {
+    tplan *p = NULL; int n = 0, cap = 0;
+    char nm[192], hf[192];
+    plan_add(&p,&n,&cap,"token_embd.weight", DS4Q_TYPE_Q8_0, 2, 6144, 154880, 0, "model.embed_tokens.weight");
+    plan_add(&p,&n,&cap,"output.weight",     DS4Q_TYPE_Q8_0, 2, 6144, 154880, 0, "lm_head.weight");
+    plan_add(&p,&n,&cap,"output_norm.weight",DS4Q_TYPE_F32,  1, 6144, 0, 0, "model.norm.weight");
+    for (int L = 0; L < n_layers; L++) {
+        #define NM(s) (snprintf(nm,sizeof(nm),"blk.%d.%s",L,s), nm)
+        #define HF(s) (snprintf(hf,sizeof(hf),"model.layers.%d.%s",L,s), hf)
+        plan_add(&p,&n,&cap,NM("attn_norm.weight"),     DS4Q_TYPE_F32, 1,6144,0,0,    HF("input_layernorm.weight"));
+        plan_add(&p,&n,&cap,NM("ffn_norm.weight"),      DS4Q_TYPE_F32, 1,6144,0,0,    HF("post_attention_layernorm.weight"));
+        plan_add(&p,&n,&cap,NM("attn_q_a.weight"),      DS4Q_TYPE_Q8_0,2,6144,2048,0, HF("self_attn.q_a_proj.weight"));
+        plan_add(&p,&n,&cap,NM("attn_q_a_norm.weight"), DS4Q_TYPE_F32, 1,2048,0,0,    HF("self_attn.q_a_layernorm.weight"));
+        plan_add(&p,&n,&cap,NM("attn_kv.weight"),       DS4Q_TYPE_Q8_0,2,6144,576,0,  HF("self_attn.kv_a_proj_with_mqa.weight"));
+        plan_add(&p,&n,&cap,NM("attn_kv_a_norm.weight"),DS4Q_TYPE_F32, 1,512,0,0,     HF("self_attn.kv_a_layernorm.weight"));
+        if (L < GLM_FIRST_K_DENSE) {
+            plan_add(&p,&n,&cap,NM("ffn_gate_dense.weight"),DS4Q_TYPE_Q8_0,2,6144,12288,0, HF("mlp.gate_proj.weight"));
+            plan_add(&p,&n,&cap,NM("ffn_up_dense.weight"),  DS4Q_TYPE_Q8_0,2,6144,12288,0, HF("mlp.up_proj.weight"));
+            plan_add(&p,&n,&cap,NM("ffn_down_dense.weight"),DS4Q_TYPE_Q8_0,2,12288,6144,0, HF("mlp.down_proj.weight"));
+        } else {
+            plan_add(&p,&n,&cap,NM("ffn_gate_inp.weight"),  DS4Q_TYPE_F32, 2,6144,256,0, HF("mlp.gate.weight"));
+            plan_add(&p,&n,&cap,NM("exp_probs_b.bias"),     DS4Q_TYPE_F32, 1,256,0,0,    HF("mlp.gate.e_score_correction_bias"));
+            plan_add(&p,&n,&cap,NM("ffn_gate_shexp.weight"),DS4Q_TYPE_Q8_0,2,6144,2048,0, HF("mlp.shared_experts.gate_proj.weight"));
+            plan_add(&p,&n,&cap,NM("ffn_up_shexp.weight"),  DS4Q_TYPE_Q8_0,2,6144,2048,0, HF("mlp.shared_experts.up_proj.weight"));
+            plan_add(&p,&n,&cap,NM("ffn_down_shexp.weight"),DS4Q_TYPE_Q8_0,2,2048,6144,0, HF("mlp.shared_experts.down_proj.weight"));
+        }
+        #undef NM
+        #undef HF
+    }
+    *count = n;
+    return p;
+}
+
+static void write_gguf_full(const char *out, const char *hf_dir, int n_layers) {
+    stdb db; stdb_open(&db, hf_dir);
+    int n = 0;
+    tplan *plan = build_plan(n_layers, &n);
+
+    /* offsets are analytic: sizes depend only on type+shape (ds4q_row_size). */
+    uint64_t off = 0;
+    for (int i = 0; i < n; i++) {
+        int64_t nrows = plan_nrows(&plan[i]);
+        size_t rs = ds4q_row_size(plan[i].type, plan[i].ne[0]);
+        plan[i].nbytes = (uint64_t)rs * (uint64_t)nrows;
+        plan[i].offset = off;
+        off = ds4q_pad(off + plan[i].nbytes, 32);
+    }
+
+    buf kv = {0}; int nk = 0;
+    emit_metadata(&kv, &nk);
+    emit_tokenizer(&kv, &nk, hf_dir);
+
+    FILE *f = fopen(out, "wb");
+    if (!f) die("cannot open output gguf");
+    uint32_t magic = GGUF_MAGIC, ver = GGUF_VERSION;
+    uint64_t nt = (uint64_t)n, nkv = (uint64_t)nk, pos = 0;
+    fwrite(&magic,4,1,f); fwrite(&ver,4,1,f); fwrite(&nt,8,1,f); fwrite(&nkv,8,1,f); pos += 24;
+    fwrite(kv.d,1,kv.n,f); pos += kv.n; free(kv.d);
+    for (int i = 0; i < n; i++) {
+        tplan *t = &plan[i];
+        uint64_t nl = strlen(t->name);
+        fwrite(&nl,8,1,f); fwrite(t->name,1,nl,f); pos += 8 + nl;
+        uint32_t nd = (uint32_t)t->ndim; fwrite(&nd,4,1,f); pos += 4;
+        for (int dd = 0; dd < t->ndim; dd++) { uint64_t e=(uint64_t)t->ne[dd]; fwrite(&e,8,1,f); pos += 8; }
+        uint32_t ty = (uint32_t)t->type; fwrite(&ty,4,1,f); pos += 4;
+        fwrite(&t->offset,8,1,f); pos += 8;
+    }
+    while (pos < ds4q_pad(pos, 32)) { fputc(0, f); pos++; }   /* align data section */
+
+    uint64_t dpos = 0;
+    for (int i = 0; i < n; i++) {
+        tplan *t = &plan[i];
+        while (dpos < t->offset) { fputc(0, f); dpos++; }
+        const gtensor *g = stdb_find(&db, t->hf);
+        if (!g) { fprintf(stderr, "glm-quantize: missing source %s\n", t->hf); exit(1); }
+        int64_t nelem = 0;
+        float *src = stdb_read_f32(&db, g, &nelem);
+        int64_t nrows = plan_nrows(t), ncols = t->ne[0];
+        if (nelem != nrows * ncols) {
+            fprintf(stderr, "glm-quantize: %s size %lld != %lld*%lld\n",
+                    t->name, (long long)nelem, (long long)nrows, (long long)ncols);
+            exit(1);
+        }
+        if (t->type == DS4Q_TYPE_F32) {
+            fwrite(src, 4, (size_t)nelem, f);
+        } else if (t->type == DS4Q_TYPE_F16) {
+            uint16_t *d = xmalloc((size_t)nelem * 2);
+            ds4q_f32_to_f16_row(src, d, nelem);
+            fwrite(d, 2, (size_t)nelem, f); free(d);
+        } else {
+            void *dst = xmalloc(t->nbytes);
+            ds4q_quantize_init(t->type);
+            size_t got = ds4q_quantize_chunk(t->type, src, dst, 0, nrows, ncols, NULL);
+            if (got != t->nbytes) {
+                fprintf(stderr, "glm-quantize: %s quant %zu != %llu\n",
+                        t->name, got, (unsigned long long)t->nbytes);
+                exit(1);
+            }
+            fwrite(dst, 1, got, f); free(dst);
+        }
+        dpos += t->nbytes;
+        free(src);
+        if ((i % 100) == 0 || i == n - 1)
+            fprintf(stderr, "  [%d/%d] %s\n", i + 1, n, t->name);
+    }
+    fclose(f);
+    printf("wrote %s: %d tensors, %d KV, %d layers (NOTE: attn_q_b/attn_output/experts still TODO)\n",
+           out, n, nk, n_layers);
+    free(plan);
+}
+
 /* Minimal GGUF reader for --verify: lists KV keys, confirms structural validity. */
 static uint32_t r_u32(FILE *f){ uint32_t v; if(fread(&v,4,1,f)!=1) die("read u32"); return v; }
 static uint64_t r_u64(FILE *f){ uint64_t v; if(fread(&v,8,1,f)!=1) die("read u64"); return v; }
@@ -664,7 +808,17 @@ static void verify_gguf(const char *path){
     printf("magic=%.4s version=%u n_tensors=%llu n_kv=%llu\n",
            (char*)&magic, ver, (unsigned long long)nt, (unsigned long long)nk);
     if (magic != GGUF_MAGIC) die("not a GGUF file");
-    for (uint64_t i=0;i<nk;i++){ char *k=r_str(f); uint32_t t=r_u32(f); printf("  %s\n", k); free(k); skip_value(f,t); }
+    for (uint64_t i=0;i<nk;i++){ char *k=r_str(f); uint32_t t=r_u32(f); printf("  KV %s\n", k); free(k); skip_value(f,t); }
+    for (uint64_t i=0;i<nt;i++){
+        char *nme=r_str(f); uint32_t nd=r_u32(f);
+        int64_t ne[4]={1,1,1,1};
+        for (uint32_t j=0;j<nd;j++){ uint64_t e=r_u64(f); if(j<4) ne[j]=(int64_t)e; }
+        uint32_t ty=r_u32(f); uint64_t of=r_u64(f);
+        if (i < 24 || i+4 >= nt)
+            printf("  T %-28s type=%u ne=[%lld,%lld,%lld] off=%llu\n", nme, ty,
+                   (long long)ne[0],(long long)ne[1],(long long)ne[2],(unsigned long long)of);
+        free(nme);
+    }
     fclose(f);
 }
 
@@ -764,27 +918,33 @@ static void usage(void) {
         "  --hf <dir>        directory with GLM-5.2 model-*.safetensors shards\n"
         "  --dry-run         scan shard headers and report converter coverage (default)\n"
         "  --read <tensor>   read one HF tensor, dequantize to f32, print shape + stats\n"
-        "  --write-gguf <o>  author a GLM GGUF (metadata only for now) to <o>\n"
-        "  --verify <gguf>   read back a GGUF header and list its metadata keys\n");
+        "  --write-gguf <o>  author a GLM GGUF (metadata + tokenizer, 0 tensors) to <o>\n"
+        "  --write-full <o>  author a GLM GGUF with tensor data (passthrough; --layers N)\n"
+        "  --layers <N>      limit --write-full to the first N layers (default 78)\n"
+        "  --verify <gguf>   read back a GGUF header; list metadata keys + tensor infos\n");
     exit(1);
 }
 
 int main(int argc, char **argv) {
-    const char *hf_dir = NULL, *read_name = NULL, *write_out = NULL, *verify_in = NULL;
+    const char *hf_dir = NULL, *read_name = NULL, *write_out = NULL, *write_full = NULL, *verify_in = NULL;
+    int n_layers = 78;
     bool dry_run = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--hf") == 0 && i + 1 < argc) hf_dir = argv[++i];
         else if (strcmp(argv[i], "--read") == 0 && i + 1 < argc) read_name = argv[++i];
         else if (strcmp(argv[i], "--write-gguf") == 0 && i + 1 < argc) write_out = argv[++i];
+        else if (strcmp(argv[i], "--write-full") == 0 && i + 1 < argc) write_full = argv[++i];
+        else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) n_layers = atoi(argv[++i]);
         else if (strcmp(argv[i], "--verify") == 0 && i + 1 < argc) verify_in = argv[++i];
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) usage();
         else { fprintf(stderr, "glm-quantize: unknown arg: %s\n", argv[i]); usage(); }
     }
 
-    /* --verify needs only the gguf; --write-gguf needs --hf for the tokenizer. */
+    /* --verify needs only the gguf; the writers need --hf. */
     if (verify_in) { verify_gguf(verify_in); return 0; }
     if (write_out) { if (!hf_dir) usage(); write_gguf_meta(write_out, hf_dir); return 0; }
+    if (write_full) { if (!hf_dir) usage(); if (n_layers < 0) n_layers = 0; write_gguf_full(write_full, hf_dir, n_layers); return 0; }
 
     if (!hf_dir) usage();
     stdb db;

@@ -32,8 +32,8 @@ all: deepseek4-quantize glm-quantize
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
 
-glm-quantize: glm-quantize.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ glm-quantize.c
+glm-quantize: glm-quantize.c quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ glm-quantize.c quants.c -lm -pthread
 
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
