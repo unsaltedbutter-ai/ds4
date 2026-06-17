@@ -22,6 +22,21 @@ log at the bottom every working session.
 | Sync mechanism | commit on this machine → push `origin` → `git pull` on notible |
 | Git remotes | `origin` = `unsaltedbutter-ai/ds4` (fork), `upstream` = `antirez/ds4` |
 
+### 🔴 notible memory / port-8085 server-down gate
+
+The prod DeepSeek server (port 8085, kept alive by a **launchd agent** — a plain SIGTERM
+won't free its memory; the agent must be unloaded by the user) can stay up for most of this
+work. It only has to come **down** when we load GLM weights into notible's memory / run GLM
+on Metal.
+
+- ✅ **Server stays UP:** converter/quantizer runs (CPU + disk, a few GB RAM), all engine
+  source edits + `make` builds, small CPU-slice sanity checks.
+- 🔴 **Server must come DOWN (flagged before each):** imatrix collection (runs the model on
+  Metal), first Metal forward-pass bring-up, any full-model load or Q2/Q4 run on notible.
+
+**Commitment:** flag "this step needs port 8085 down" before any 🔴 step; the user stops the
+launchd agent. Phase 0/1 and most of 2 are ✅; the gate is first crossed in Phase 3/4.
+
 Small model config files are already downloaded on notible: `config.json`,
 `chat_template.jinja`, `generation_config.json`, `README.md`, `LICENSE`.
 **Not yet down:** `model.safetensors.index.json`, `tokenizer_config.json`,
@@ -258,10 +273,10 @@ HC state, so no payload version bump for this.
 
 ### Phase 3 — Metal + server
 - [ ] Metal graph at HC=1; tokenizer + chat template + multi-EOS + `<tool_call>`
-- [ ] Server answers a real prompt end to end
+- [ ] 🔴 Server answers a real prompt end to end (first Metal run on notible — needs port 8085 down)
 
 ### Phase 4 — Q2 + Q4 build & streaming on notible
-- [ ] Build imatrix (include coding-agent traffic per porting.md §5)
+- [ ] 🔴 Build imatrix (runs the model on Metal — needs port 8085 down)
 - [ ] Produce **Q2** GGUF: IQ2_XXS gate/up + Q2_K down + Q8_0 rest (~210-225 GB)
 - [ ] Produce **Q4** GGUF: Q4_K experts + Q8_0 rest (~400-440 GB; on 256 GB this is **SSD-streaming only**)
 - [ ] **Compare Q2 vs Q4**: logit/quality parity vs reference + inference speed (expected: keep Q2 if good enough, but make the comparison real)
@@ -284,6 +299,7 @@ HC state, so no payload version bump for this.
 - Non-expert precision in Q2 (Q8 vs F16 for attention/router/embeddings) — moves total by tens of GB.
 - KV-cache storage precision in ds4 today (FP16 vs FP8 latent) and whether 8-bit KV is wired for the uncompressed (`compress_ratio=0`) path — drives the M1 context math.
 - Does building **both Q2 and Q4** need two converter runs from the same imatrix, or can one pass emit both? (affects Phase 4 time.)
+- **Golden reference strategy:** full GLM-5.2 bf16 (~1.5 TB) won't fit a 256 GB box, so we can't run a local HF reference of the whole model. Plan: official GLM API for end-to-end logprob vectors + a **CPU slice** (first few layers) for intermediate-tensor parity during Phase 2.
 
 ---
 
