@@ -10361,6 +10361,7 @@ static void forward_first_token_cpu(
     hc_from_plain_embedding(cur, plain, DS4_N_EMBD, DS4_N_HC);
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (getenv("DS4_FWD_TRACE")) { fprintf(stderr, "fwd layer %u\n", il); fflush(stderr); }
         layer_forward_self_one(next, model, &weights->layer[il], cur, il, 0, token);
         float *tmp = cur;
         cur = next;
