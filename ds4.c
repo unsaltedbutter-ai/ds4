@@ -15136,6 +15136,7 @@ static bool metal_graph_encode_decode_layer_glm(
     const float kq_scale = 1.0f / sqrtf(256.0f);
     const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
     bool ok = true;
+#define GLM_STEP(label) do { if (!ok) { fprintf(stderr, "ds4: GLM decode layer %u: %s failed\n", il, (label)); return false; } } while (0)
 
     /* hc_pre (attn): GLM bypasses HC, so the sublayer input is RMSNorm(residual)
      * and the residual itself is cur_hc. */
@@ -15152,6 +15153,7 @@ static bool metal_graph_encode_decode_layer_glm(
     if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, 0, false,
                                           freq_base, freq_scale, 0.0f, 1.0f,
                                           DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+    GLM_STEP("q_path");
     /* KV: project the 576 latent, RMSNorm only the first n_value_dim (c_kv) and
      * leave the decoupled rope tail raw, rope the tail, store FP8 to the cache. */
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv, model->map, model->size, layer->attn_kv->abs_offset,
@@ -15162,16 +15164,20 @@ static bool metal_graph_encode_decode_layer_glm(
                                           freq_base, freq_scale, 0.0f, 1.0f,
                                           DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
     if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
+    GLM_STEP("kv_store");
     /* Attention: 576-wide key, 512-wide rope-free value, no sinks.  No inverse
      * rope on the heads (the value context is the rope-free c_kv). */
     if (ok) ok = ds4_gpu_attention_decode_heads_glm_tensor(g->heads, g->q, raw_cache, n_raw, raw_cap, raw_start,
                                                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, kq_scale) != 0;
+    GLM_STEP("attention");
     /* Plain absorbed output projection [n_head*n_value_dim -> n_embd]. */
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->attn_out, model->map, model->size, layer->attn_output->abs_offset,
                                             value_heads_dim, DS4_N_EMBD, g->heads, 1) != 0;
+    GLM_STEP("o_proj");
     /* hc_post (attn): plain residual add. */
     if (ok) ok = ds4_gpu_add_tensor(g->after_attn_hc, g->attn_out, g->cur_hc, DS4_N_EMBD) != 0;
 
+    GLM_STEP("attn_residual");
     /* hc_pre (ffn): RMSNorm(after_attn_hc). */
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm, g->after_attn_hc, model->map, model->size,
                                                 layer->ffn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS) != 0;
@@ -15220,8 +15226,11 @@ static bool metal_graph_encode_decode_layer_glm(
                                                    DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm, il) != 0;
         if (ok) ok = ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
     }
+    GLM_STEP("ffn");
     /* hc_post (ffn): plain residual add into the next residual stream. */
     if (ok) ok = ds4_gpu_add_tensor(g->after_ffn_hc, g->ffn_out, g->after_attn_hc, DS4_N_EMBD) != 0;
+    GLM_STEP("ffn_residual");
+#undef GLM_STEP
     return ok;
 }
 
