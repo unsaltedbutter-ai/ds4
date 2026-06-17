@@ -120,7 +120,7 @@ enum {
     DS4_MAX_LORA_Q           = 1536,
     DS4_MAX_LORA_O           = 1024,
     DS4_MAX_EXPERT           = 384,
-    DS4_MAX_EXPERT_USED      = 6,
+    DS4_MAX_EXPERT_USED      = 8,   /* GLM-5.2 uses 8 experts/token (DeepSeek uses 6) */
     DS4_MAX_EXPERT_SHARED    = 1,
     DS4_MAX_FF_EXP           = 3072,
     DS4_MAX_HASH_LAYER       = 3,
