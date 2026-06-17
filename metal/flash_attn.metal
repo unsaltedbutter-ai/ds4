@@ -1378,6 +1378,11 @@ typedef decltype(kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4
 // Host-visible decode FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk512_dv512")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,  1, dequantize_f16_t4, half4,  1, dequantize_f16_t4, 512, 512, 1>;
 
+// GLM-5.2 decode variant: absorbed-MLA latent key is 576 wide (512 c_kv + 64
+// decoupled rope), but the value is only the rope-free 512-wide c_kv. Same kernel
+// body as the DS4 512/512 path with a wider key (DK) than value (DV).
+template [[host_name("kernel_flash_attn_ext_vec_f16_dk576_dv512")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,  1, dequantize_f16_t4, half4,  1, dequantize_f16_t4, 576, 512, 1>;
+
 #undef FA_TYPES
 #undef FA_TYPES_F32
 
