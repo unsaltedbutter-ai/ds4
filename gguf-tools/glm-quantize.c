@@ -771,17 +771,32 @@ static float *produce_o_absorb(stdb *db, int L) {
 typedef struct { stdb *db; const char *tmpl; ds4q_type type; int64_t per_rows, ncols; size_t row_bytes; uint8_t *out; } exp_ctx;
 static void exp_range(int e0, int e1, void *c) {
     const exp_ctx *x = c;
+    const bool need_imat = ds4q_requires_imatrix(x->type);
+    float *imat = need_imat ? xmalloc((size_t)x->ncols * sizeof(float)) : NULL;
     for (int E = e0; E < e1; E++) {
         char nm[256]; snprintf(nm, sizeof(nm), x->tmpl, E);
         const gtensor *g = stdb_find(x->db, nm);
         if (!g) { fprintf(stderr, "glm-quantize: missing %s\n", nm); exit(1); }
         int64_t ne = 0; float *src = stdb_read_f32(x->db, g, &ne);
         if (ne != x->per_rows * x->ncols) { fprintf(stderr, "glm-quantize: %s size mismatch\n", nm); exit(1); }
+        if (need_imat) {
+            /* synthetic importance = per-column weight energy (no real imatrix yet) */
+            for (int64_t cc = 0; cc < x->ncols; cc++) imat[cc] = 0.0f;
+            for (int64_t r = 0; r < x->per_rows; r++) {
+                const float *row = src + (size_t)r * x->ncols;
+                for (int64_t cc = 0; cc < x->ncols; cc++) imat[cc] += row[cc] * row[cc];
+            }
+        }
         ds4q_quantize_chunk(x->type, src, x->out + (size_t)E * x->per_rows * x->row_bytes,
-                            0, x->per_rows, x->ncols, NULL);
+                            0, x->per_rows, x->ncols, imat);
         free(src);
     }
+    free(imat);
 }
+
+/* Routed-expert quant types: default Q4_K; --q2 sets IQ2_XXS gate/up + Q2_K down. */
+static ds4q_type g_exp_gu_type = DS4Q_TYPE_Q4_K;
+static ds4q_type g_exp_down_type = DS4Q_TYPE_Q4_K;
 
 static tplan *build_plan(int n_layers, int *count) {
     tplan *p = NULL; int n = 0, cap = 0;
@@ -812,11 +827,11 @@ static tplan *build_plan(int n_layers, int *count) {
             plan_add(&p,&n,&cap,NM("ffn_down_shexp.weight"),DS4Q_TYPE_Q8_0,2,2048,6144,0, HF("mlp.shared_experts.down_proj.weight"));
             char tmpl[256];
             snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.gate_proj.weight",L);
-            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_gate_exps.weight"),DS4Q_TYPE_Q4_K,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_gate_exps.weight"),g_exp_gu_type,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
             snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.up_proj.weight",L);
-            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_up_exps.weight"),  DS4Q_TYPE_Q4_K,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_up_exps.weight"),  g_exp_gu_type,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
             snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.down_proj.weight",L);
-            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_down_exps.weight"),DS4Q_TYPE_Q4_K,3,2048,6144,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_down_exps.weight"),g_exp_down_type,3,2048,6144,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
         }
         #undef NM
         #undef HF
@@ -1071,6 +1086,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--write-gguf") == 0 && i + 1 < argc) write_out = argv[++i];
         else if (strcmp(argv[i], "--write-full") == 0 && i + 1 < argc) write_full = argv[++i];
         else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) n_layers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--q2") == 0) { g_exp_gu_type = DS4Q_TYPE_IQ2_XXS; g_exp_down_type = DS4Q_TYPE_Q2_K; }
         else if (strcmp(argv[i], "--verify") == 0 && i + 1 < argc) verify_in = argv[++i];
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) usage();
