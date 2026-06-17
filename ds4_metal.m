@@ -22674,7 +22674,7 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                layer_index) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
-        n_total_expert == 0 || n_expert == 0 || n_expert > 6 ||
+        n_total_expert == 0 || n_expert == 0 || n_expert > DS4_GPU_MAX_EXPERT_USED ||
         gate_expert_bytes == 0 || down_expert_bytes == 0 ||
         gate_row_bytes == 0 || down_row_bytes == 0) {
         return 0;
@@ -22773,7 +22773,7 @@ int ds4_gpu_routed_moe_one_tensor(
         DS4MetalQ4ExpertTable *up_table = nil;
         DS4MetalQ4ExpertTable *down_table = nil;
         id q4_table_layer_residency = nil;
-        int32_t selected_ids[6] = { 0, 0, 0, 0, 0, 0 };
+        int32_t selected_ids[DS4_GPU_MAX_EXPERT_USED] = { 0 };
 
         const uint32_t n_tokens = 1;
         const uint32_t pair_rows = n_tokens * n_expert;
