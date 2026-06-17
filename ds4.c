@@ -6948,7 +6948,15 @@ static void layer_kv_projection_normed_one(
     const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
 
     matvec_q8_0(raw, model, layer->attn_kv, normed);
-    rms_norm_weight(kv, raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* kv latent = [c_kv (value_dim) ; k_rope (n_rot)]; normalize only the
+         * c_kv part and pass the decoupled rope tail through unnormalized. */
+        rms_norm_weight(kv, raw, kv_norm, DS4_N_VALUE_DIM, DS4_RMS_EPS);
+        memcpy(kv + DS4_N_VALUE_DIM, raw + DS4_N_VALUE_DIM,
+               (size_t)(DS4_N_HEAD_DIM - DS4_N_VALUE_DIM) * sizeof(kv[0]));
+    } else {
+        rms_norm_weight(kv, raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    }
 
     free(raw);
 }
@@ -7209,34 +7217,39 @@ static void layer_attention_rows_one(
         const float       * q,
         const float       * kv_rows,
         uint32_t            n_kv) {
-    const float *sinks = tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    /* GLM has no attention sinks, attends in a 576-wide key latent but its value
+     * is only the 512-wide c_kv (rope tail excluded), and scales by the original
+     * per-head qk dim (qk_nope 192 + qk_rope 64 = 256) -- VERIFY vs reference. */
+    const bool glm = DS4_MODEL_VARIANT == DS4_VARIANT_GLM;
+    const float *sinks = glm ? NULL : tensor_data(model, layer->attn_sinks);
+    const uint32_t vdim = glm ? DS4_N_VALUE_DIM : DS4_N_HEAD_DIM;
+    const float kq_scale = 1.0f / sqrtf(glm ? 256.0f : (float)DS4_N_HEAD_DIM);
     float score_stack[512];
     float *score = n_kv <= 512 ? score_stack : xmalloc((size_t)n_kv * sizeof(score[0]));
 
     for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
         const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
 
-        float max_score = sinks[h];
+        float max_score = sinks ? sinks[h] : -1e30f;  /* n_kv>=1 always updates it */
         for (uint32_t r = 0; r < n_kv; r++) {
             const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
             score[r] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
             if (score[r] > max_score) max_score = score[r];
         }
 
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
-        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
+        float *oh = out_heads + (uint64_t)h * vdim;
+        memset(oh, 0, (size_t)vdim * sizeof(oh[0]));
 
-        float denom = expf(sinks[h] - max_score);
+        float denom = sinks ? expf(sinks[h] - max_score) : 0.0f;
         for (uint32_t r = 0; r < n_kv; r++) {
             const float weight = expf(score[r] - max_score);
             const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
             denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
+            axpy_f32(oh, kv, weight, vdim);
         }
 
         const float inv = 1.0f / denom;
-        scale_f32(oh, inv, DS4_N_HEAD_DIM);
+        scale_f32(oh, inv, vdim);
     }
 
     if (score != score_stack) free(score);
@@ -7258,6 +7271,11 @@ static void layer_grouped_out_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * heads) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM: plain absorbed output projection [n_head*n_value_dim -> n_embd]. */
+        matvec_q8_0(out, model, layer->attn_output, heads);
+        return;
+    }
     const uint32_t n_groups = 8;
     const uint32_t group_heads = DS4_N_HEAD / n_groups;
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
