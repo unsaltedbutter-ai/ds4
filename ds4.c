@@ -22455,6 +22455,12 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
     return token;
 }
 
+static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
+    int token = -1;
+    table_get(&vocab->token_to_id, text, strlen(text), &token);
+    return token;
+}
+
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
@@ -22489,13 +22495,24 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
-    vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
-    vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
-    vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
-    vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
-    vocab->think_start_id = vocab_lookup(vocab, "<think>");
-    vocab->think_end_id = vocab_lookup(vocab, "</think>");
-    vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM-family special tokens (no DeepSeek BOS/DSML). */
+        vocab->bos_id         = vocab_lookup_optional(vocab, "[gMASK]");
+        vocab->eos_id         = vocab_lookup_optional(vocab, "<|endoftext|>");
+        vocab->user_id        = vocab_lookup_optional(vocab, "<|user|>");
+        vocab->assistant_id   = vocab_lookup_optional(vocab, "<|assistant|>");
+        vocab->think_start_id = vocab_lookup_optional(vocab, "<think>");
+        vocab->think_end_id   = vocab_lookup_optional(vocab, "</think>");
+        vocab->dsml_id        = -1;
+    } else {
+        vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
+        vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
+        vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
+        vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+    }
 }
 
 static void vocab_free(ds4_vocab *vocab) {
