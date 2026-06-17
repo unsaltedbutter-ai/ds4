@@ -13,6 +13,7 @@
 *.dSYM/
 __pycache__/
 *.pyc
+.venv/
 /misc/
 .*.swp
 .DS_Store
