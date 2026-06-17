@@ -6590,6 +6590,17 @@ static void hc_pre_from_state_one_scratch(
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * n_hc;
 
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM has no Hyper-Connections: a single residual stream. The sublayer
+         * input is the residual itself (attn_norm/ffn_norm is applied by the
+         * caller), and identity post/combine gates make hc_post a plain residual
+         * add. This bypasses the HC tensors GLM does not carry. */
+        memcpy(out, residual_hc, (size_t)DS4_N_EMBD * sizeof(out[0]));
+        post[0] = 1.0f;
+        comb[0] = 1.0f;
+        return;
+    }
+
     float mix[24];
     float split[24];
 
