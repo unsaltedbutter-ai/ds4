@@ -115,15 +115,48 @@ numbers from a 35-day baseline; may drift).
 | tool DSML render/parse | `dsml_syntaxes[]` | ds4_server.c:~4214,5245 | GLM `<tool_call>` format |
 | HF→GGUF quantizer | `deepseek4-quantize.c` | gguf-tools/ | bf16 read + GLM names |
 
+## 2b. Verified GLM tensor schema (from shard headers, 2026-06-16)
+
+Per-layer names/shapes (all BF16) the converter maps to ds4's GGUF tensors:
+
+| GLM tensor | shape | ds4 target / note |
+|---|---|---|
+| `embed_tokens.weight` | [154880,6144] | token embeddings |
+| `lm_head.weight` | [154880,6144] | output head (untied) |
+| `layers.N.input_layernorm` | [6144] | attn pre-norm |
+| `layers.N.post_attention_layernorm` | [6144] | ffn pre-norm (**only 2 norms/layer — confirms no HC**) |
+| `self_attn.q_a_proj` | [2048,6144] | q down (q_lora 2048) |
+| `self_attn.q_a_layernorm` | [2048] | q latent norm |
+| `self_attn.q_b_proj` | [16384,2048] | q up (64h × 256) |
+| `self_attn.kv_a_proj_with_mqa` | [576,6144] | kv down (512 latent + 64 rope) |
+| `self_attn.kv_a_layernorm` | [512] | kv latent norm (latent only, not rope) |
+| `self_attn.kv_b_proj` | [28672,512] | kv up (64h × (192 nope + 256 v)) |
+| `self_attn.o_proj` | [6144,16384] | **plain o_proj (delta A)** |
+| `self_attn.indexer.wq_b` | [4096,2048] | DSA idx q (32h × 128) — v1: skip |
+| `self_attn.indexer.wk` | [128,6144] | DSA idx key — v1: skip |
+| `self_attn.indexer.k_norm.{weight,bias}` | [128] | DSA idx norm (+bias, unlike ds4) — v1: skip |
+| `self_attn.indexer.weights_proj` | [32,6144] | DSA idx head weights — v1: skip |
+| `mlp.{gate,up}_proj` (L<3) | [12288,6144] | **dense SwiGLU (delta C)** |
+| `mlp.down_proj` (L<3) | [6144,12288] | dense down |
+| `mlp.experts.{0..255}.{gate,up}_proj` (L≥3) | [2048,6144] | **256 separate tensors → STACK** into ds4 3-D expert layout |
+| `mlp.experts.{0..255}.down_proj` (L≥3) | [6144,2048] | stack |
+
+**Converter's biggest job:** experts ship as 256 separate tensors per projection per MoE
+layer; ds4 expects them stacked `[blocks, features, expert_id]`. Still TODO from a later
+shard / the index: router (`mlp.gate`), shared-expert (`mlp.shared_experts.*`), final
+`model.norm`, and MTP (`nextn`) tensor names — pending `model.safetensors.index.json`.
+
 ---
 
 ## 3. Risk register (ranked)
 
-- **R1 — Hyper-Connections removal (HIGH, gating).** ds4's residual stream uses HC
-  (`n_hc=4`, sinkhorn; ~562 refs in `ds4.c`, plus `metal/dsv4_hc.metal`, KV payload,
-  distributed proto). GLM uses standard residuals. Must run `n_hc=1`. Unknown whether
-  that is a clean degenerate path or needs graph surgery. **Not mentioned in porting.md —
-  prove this first (Phase 2 spike) before committing to a timeline.**
+- **R1 — Hyper-Connections bypass (MED — RESOLVED by spike, was the gating unknown).**
+  ds4's residual stream uses HC (`n_hc=4`, sinkhorn, trained per-layer tensors
+  `hc_attn_*`/`hc_ffn_*`/`output_hc_*`). GLM has standard residuals and **no HC tensors**
+  (every layer is just `input_layernorm` + `post_attention_layernorm` — verified from shard
+  headers), so we do not run "n_hc=1 with weights" — we **bypass HC entirely** and fall back
+  to the standard pre-norm residual (`h += sublayer(norm(h))`). Spike verdict: not a rewrite;
+  ~6-8 HC-disabled sites (see §3c), low correctness risk; gate on CPU logit parity.
 - **R2 — KV "compression" is trained, GLM lacks it (MED, design).** ds4 ratio-2/4
   compression uses trained `attn_compressor_*`/`indexer_compressor_*` tensors absent in
   GLM. Run `compress_ratio=0` everywhere (raw MLA latent KV; loader already supports it).
@@ -169,6 +202,35 @@ just a token. With SSD streaming the model bytes can exceed RAM, so the real bud
 Deliverable: a recommended 256 GB recipe (quant mix + KV precision + cache budget) and the
 ctx/speed table, validated against the Q8 reference.
 
+## 3c. Spike results (2026-06-16) — HC bypass + attention/FFN deltas
+
+**HC bypass (R1).** Hidden state is a flat `[n_hc*n_embd]` buffer (`ds4.c:~8364`),
+stream-major. CPU loops mostly use dynamic `n_hc`; Metal has `n_hc==4` fast paths with live
+scalar fallbacks, plus two fused decode kernels that hard-reject `n_hc!=4` and auto-downgrade
+to unfused (`ds4_metal.m:~25862,~25981`). HC consumes trained tensors GLM lacks. HC-disabled
+path = these sites:
+1. Per-layer `hc_pre_*` → plain `RMSNorm(h)` for sublayer input (`ds4.c:~6463,~6497`).
+2. Per-layer `hc_post_one` → plain residual add (`ds4.c:~6512`).
+3. Embedding expand `hc_from_plain_embedding` → identity / single stream (`ds4.c:~6504`).
+4. Output head `output_hc_*` collapse → skip (hidden already `[n_embd]`).
+5. Tensor validation: skip required HC tensors when disabled (`ds4.c:3588-3622`).
+6. Metal: accept the unfused fallback (drop the `n_hc==4` requirement) — no kernel rewrite.
+Fixed buffers `post[4]`/`comb[16]` are safe over-allocations. Session payload does NOT store
+HC state, so no payload version bump for this.
+
+**Attention/FFN deltas (effort).**
+- **A. Output projection — LOW.** Replace grouped 2-stage output LoRA (`layer_grouped_out_one`
+  `ds4.c:7094-7142`; Metal `ds4_metal.m:16051-16380`) with a single o_proj matmul
+  `[64*256=16384 → 6144]`. Reuses existing matmul; ~5-10 CPU lines, no new kernel.
+- **B. Q/KV up-projection — MED (the real attention work).** GLM per-head `qk_nope=192`/`v=256`
+  vs ds4's absorbed 512 latent; `q_lora` 1024→2048, `q_b`→16384, `kv_b`→`64*448=28672`
+  (`ds4.c:6742-6794`, Metal `~17357-17612`). Open: confirm whether ds4 runs absorbed MLA and
+  how `kv_b` folds; thread GLM's nope/value dims + rope indexing.
+- **C. Dense first-3 layers — LOW-MED.** No dense FFN path exists today (only routed-MoE +
+  shared-expert SwiGLU `layer_shared_ffn_one` `ds4.c:7184-7216`, intermediate hardcoded to
+  `n_ff_exp`). Add `layer_dense_ffn_one()` reusing the SwiGLU kernel at `intermediate=12288`,
+  branched on `il < first_k_dense_replace`.
+
 ---
 
 ## 4. Phased plan
@@ -178,9 +240,11 @@ ctx/speed table, validated against the Q8 reference.
 - [x] Read GLM chat template + special tokens (groundwork for §1b)
 - [ ] Establish git sync: commit groundwork, push `ds4-glm`, check out on notible
 - [ ] Add `DS4_SHAPE_GLM` profile + relaxed shape gate so a GLM GGUF *loads* and reports correct dims (compiles; untestable until model)
-- [ ] R1 spike: trace HC through the graph; decide `n_hc=1` degeneracy vs strip. Write findings here.
+- [x] R1 spike: HC traced; verdict = HC-bypass path, ~6-8 sites, not a rewrite (see §3c)
+- [x] Attention/FFN graph-delta map: o_proj (LOW), q/kv up-proj (MED), dense first-3 (LOW-MED) (see §3c)
 - [ ] Draft GLM prompt-rendering + `<tool_call>` parser design (have the template)
-- [ ] Draft converter skeleton: bf16 safetensors reader + tensor-name map (full names pending `index.json`)
+- [x] Tensor-name schema captured from shard headers (§2b) — router/shared/MTP names + `index.json` still pending
+- [ ] Draft converter skeleton: bf16 safetensors reader + expert-stacking packer
 - [ ] Add `CLAUDE.md` for the fork (GLM context, points here)
 - [ ] Capture golden-logit plan (HF `transformers` reference; can't run until weights complete)
 
@@ -225,4 +289,5 @@ ctx/speed table, validated against the Q8 reference.
 
 ## 6. Status log
 - 2026-06-16: Investigation complete. Confirmed GLM-5.2 = `glm_moe_dsa` (MLA+DSA+MoE, DeepSeek-V4 cousin). Verified config, geometry map, GLM chat template. Identified **Hyper-Connections removal (R1)** as the gating risk (missing from porting.md). Branch `ds4-glm` ready locally; notible checkout exists on `main`; model ~18% downloaded.
-- 2026-06-16: Per user, added **Q2 and Q4 both as Phase 4 build targets** (Q4 = SSD-streaming-only on 256 GB) for a real quality/speed comparison, and the **§3b M1 memory-fit study** (quantized KV is the key lever for Q2 + large context on 256 GB). Pushing groundwork to `origin`; checking out `ds4-glm` on notible. Next: R1 HC spike + attention/FFN graph-delta map.
+- 2026-06-16: Per user, added **Q2 and Q4 both as Phase 4 build targets** (Q4 = SSD-streaming-only on 256 GB) for a real quality/speed comparison, and the **§3b M1 memory-fit study** (quantized KV is the key lever for Q2 + large context on 256 GB). Pushed groundwork to `origin`; checked out `ds4-glm` on notible (sync loop proven).
+- 2026-06-16: Ran two spikes. **R1 (HC) resolved → bypass path, ~6-8 sites, not a rewrite (§3c).** Attention/FFN deltas mapped: o_proj LOW, dense-first-3 LOW-MED, q/kv up-proj MED (§3c). Captured **verified GLM tensor schema from shard headers (§2b)** — key converter job is stacking 256 per-expert tensors. Download now ~73% (207/282 shards). Next: converter skeleton + `DS4_SHAPE_GLM`/HC-bypass scaffolding once `index.json` lands (router/shared/MTP names).
