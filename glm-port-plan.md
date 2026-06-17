@@ -270,46 +270,43 @@ HC state, so no payload version bump for this.
 
 ## 4. Phased plan
 
-### Phase 0 — Groundwork (pre-model) ← **WE ARE HERE**
+Legend: [x] done · [~] partial · [ ] not started.
+
+### Phase 0 — Groundwork — ✅ DONE
 - [x] Architecture investigation + verified config + geometry map (this doc + porting.md)
-- [x] Read GLM chat template + special tokens (groundwork for §1b)
-- [ ] Establish git sync: commit groundwork, push `ds4-glm`, check out on notible
-- [ ] Add `DS4_SHAPE_GLM` profile + relaxed shape gate so a GLM GGUF *loads* and reports correct dims (compiles; untestable until model)
-- [x] R1 spike: HC traced; verdict = HC-bypass path, ~6-8 sites, not a rewrite (see §3c)
-- [x] Attention/FFN graph-delta map: o_proj (LOW), q/kv up-proj (MED), dense first-3 (LOW-MED) (see §3c)
-- [ ] Draft GLM prompt-rendering + `<tool_call>` parser design (have the template)
-- [x] Tensor-name schema captured from shard headers (§2b) — router/shared/MTP names + `index.json` still pending
-- [x] Converter skeleton `gguf-tools/glm-quantize.c`: safetensors scanner + GLM→ds4 map + `--dry-run` coverage (validated on partial download; router/shared/bias names confirmed)
-- [ ] Add `CLAUDE.md` for the fork (GLM context, points here)
-- [ ] Capture golden-logit plan (HF `transformers` reference; can't run until weights complete)
+- [x] GLM chat template + special tokens (§1b)
+- [x] Git sync (commit → push `ds4-glm` → `git pull` on notible)
+- [x] `DS4_SHAPE_GLM` profile + shape gate (GGUF loads, reports correct dims)
+- [x] R1 spike: HC-bypass path (§3c); attention/FFN graph-delta map (§3c); tensor-name schema (§2b)
+- [x] Converter skeleton + `--dry-run` coverage
+- [ ] `CLAUDE.md` for the fork (low priority)
 
-### Phase 1 — Converter + load (needs weights)
-- [x] Tensor-name map validated via `--dry-run`; router/shared/noaux_tc-bias names confirmed
-- [x] Converter reader: bf16/f32 dequant + `--read` (validated on real tensors: norms all-positive, projections ~±0.17 mean≈0)
-- [x] Absorbed-MLA representation resolved + fold **proven** (`check_mla_absorption.py`); attention config locked (`n_head_dim=576`/`n_value_dim=512`/partial `kv_a_norm`)
-- [ ] **GGUF schema contract** doc: finalize metadata keys + full tensor set (HC-off / plain o_proj / dense-first-3 / no compressor·sinks·hash)
-- [ ] Converter writer: config→metadata + GGUF authoring + MLA absorption (fold kv_b) + expert stacking + quantize; Q8-everything first
-- [ ] Model loads in ds4, `--inspect` reports GLM dims, tensors bind
+### Phase 1 — Converter + load — ✅ DONE
+- [x] Tensor-name map; bf16 reader; absorbed-MLA fold **proven** (`check_mla_absorption.py`)
+- [x] GGUF schema contract (§5c); converter writer (metadata + tokenizer + absorption + expert stacking + quant)
+- [x] Model loads; `ds4 --inspect` binds + validates all 1236 tensors on the real 753 B model
 
-### Phase 2 — CPU numerical bring-up ⚠️ (riskiest, cheapest place to prove it)
-- [ ] HC=1 path, dense first-3 layers, plain o_proj, GLM RoPE, indexer OFF (dense attn)
-- [ ] Single correct forward pass: logits match HF reference on short prompts
+### Phase 2 — CPU numerical bring-up — ✅ DONE
+- [x] HC bypass, dense first-3, plain o_proj, GLM RoPE (interleaved), indexer off — **full 78-layer CPU forward, finite/sane logits**
+- [~] Reference: matched against ds4's own CPU forward (HF bf16 won't fit 256 GB); **exact-vs-official-API logprob vectors still TODO**
 
-### Phase 3 — Metal + server
-- [ ] Metal graph at HC=1; tokenizer + chat template + multi-EOS + `<tool_call>`
-- [ ] 🔴 Server answers a real prompt end to end (first Metal run on notible — needs port 8085 down)
+### Phase 3 — Metal + multi-token + server ← **WE ARE HERE**
+- [x] **Metal single-token decode graph (HC=1) — VALIDATED vs CPU** (2026-06-17): `--metal-graph-full-test` gpu_top==cpu_top==154822, logits rms-diff ~0.01. On GPU: HC bypass, 576/512 absorbed attention (no sinks, kq 1/√256, plain o_proj, partial kv_a_norm, no inverse-rope), dense FFN <3, shared expert, output head. Kernel: `kernel_flash_attn_ext_vec_f16_dk576_dv512` (NE=2).
+- [ ] **8-expert Metal routed MoE — #1 remaining for SPEED** (experts ≈97% FLOPs). Currently CPU (`metal_graph_glm_cpu_routed_moe`) because the Metal MoE path is 6-experts-only (`selected_ids[6]`, `sum6` down-reduction). Needs `sum8` kernels + dispatch rework (task tracked).
+- [ ] **Multi-token generation:** CPU batch/decode + KV-cache full-attention (`n_swa=0`); the Metal prefill/batch path (`metal_graph_encode_layer_batch`); §7b. Decode-path single-token is done; prefill is not GLM-adapted.
+- [ ] Tokenizer + chat template (`[gMASK]<sop>` framing, reasoning-effort) + multi-EOS + `<tool_call>` render/parse (server-facing; §1b)
+- [ ] 🔴 Server answers a real prompt end to end + measure tokens/sec on notible
 
-### Phase 4 — Q2 + Q4 build & streaming on notible
-- [ ] 🔴 Build imatrix (runs the model on Metal — needs port 8085 down)
-- [ ] Produce **Q2** GGUF: IQ2_XXS gate/up + Q2_K down + Q8_0 rest (~210-225 GB)
-- [ ] Produce **Q4** GGUF: Q4_K experts + Q8_0 rest (~400-440 GB; on 256 GB this is **SSD-streaming only**)
-- [ ] **Compare Q2 vs Q4**: logit/quality parity vs reference + inference speed (expected: keep Q2 if good enough, but make the comparison real)
-- [ ] Apply the §3b (M1) memory-fit levers; tune SSD-streaming expert-cache vs context budget
+### Phase 4 — Quant builds & streaming — ✅ mostly DONE
+- [x] **Q2 GGUF** (`/Volumes/4TB-1/glm-5.2-q2.gguf`, 218.9 GiB) and **Q4 GGUF** (408.7 GiB) built; both `--inspect`-validated
+- [~] Q2-vs-Q4 compared at the gross level (same top token, similar logit magnitudes); rigorous quality delta needs prefill + a reference
+- [ ] imatrix calibration (currently synthetic per-column-energy importance) — real activation imatrix for better Q2
+- [ ] §3b memory-fit levers: SSD-streaming expert-cache vs context, 8-bit KV (once the Metal MoE runs fully on GPU)
 
 ### Phase 5 — Later
 - [ ] Re-enable DSA indexer (IndexShare) for long context
 - [ ] Wire GLM MTP into `--mtp`
-- [ ] Capture GLM validation vectors; rebrand CLI/server/README; license hygiene
+- [ ] GLM validation vectors (official API); rebrand CLI/server/README; license hygiene
 
 ---
 
