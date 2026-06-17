@@ -17236,21 +17236,25 @@ static int metal_graph_first_token_full_test(
                                                      DS4_N_EMBD,
                                                      DS4_N_HC) != 0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (!ok) fprintf(stderr, "ds4: full-test embed stage failed\n");
 
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             if (teacher_force) {
                 ok = ds4_gpu_tensor_write(g.cur_hc, 0, cpu_cur, hc_dim * sizeof(float)) != 0;
+                if (!ok) fprintf(stderr, "ds4: full-test il=%u teacher write failed\n", il);
             }
-            ok = ds4_gpu_begin_commands() != 0;
-            if (ok) ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
+            if (ok) { ok = ds4_gpu_begin_commands() != 0; if (!ok) fprintf(stderr, "ds4: full-test il=%u begin failed\n", il); }
+            if (ok) { ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
                                                        il, 0, g.layer_raw_cache[il], g.raw_cap, 0, 1, token);
+                      if (!ok) fprintf(stderr, "ds4: full-test il=%u encode failed\n", il); }
             ds4_gpu_tensor *tmp = g.cur_hc;
             g.cur_hc = g.after_ffn_hc;
             g.after_ffn_hc = tmp;
-            if (ok) ok = ds4_gpu_end_commands() != 0;
+            if (ok) { ok = ds4_gpu_end_commands() != 0; if (!ok) fprintf(stderr, "ds4: full-test il=%u end_commands failed\n", il); }
 
             layer_forward_self_one(cpu_next, model, &weights->layer[il], cpu_cur, il, 0, token);
-            if (ok) ok = ds4_gpu_tensor_read(g.cur_hc, 0, gpu_hc, hc_dim * sizeof(float)) != 0;
+            if (ok) { ok = ds4_gpu_tensor_read(g.cur_hc, 0, gpu_hc, hc_dim * sizeof(float)) != 0;
+                      if (!ok) fprintf(stderr, "ds4: full-test il=%u read failed\n", il); }
             if (ok) {
                 fprintf(stderr,
                         "ds4: Metal full graph layer %u%s hc_max=%g hc_rms=%g\n",
