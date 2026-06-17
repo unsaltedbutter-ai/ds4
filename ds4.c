@@ -10376,6 +10376,11 @@ static void output_hc_head_one(
         const ds4_model   * model,
         const ds4_weights * weights,
         const float       * inp_hc) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM: single residual stream, no HC collapse. */
+        memcpy(out, inp_hc, (size_t)DS4_N_EMBD * sizeof(out[0]));
+        return;
+    }
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * n_hc;
     float *flat = xmalloc((size_t)hc_dim * sizeof(flat[0]));
@@ -10423,6 +10428,13 @@ static void output_logits_one_decode_scratch(
         const ds4_weights      * weights,
         const float            * inp_hc,
         ds4_cpu_decode_scratch * scratch) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM: single stream, no HC collapse — final norm + lm_head only. */
+        rms_norm_weight(scratch->output_norm, inp_hc,
+                        tensor_data(model, weights->output_norm), DS4_N_EMBD, DS4_RMS_EPS);
+        matvec_q8_0_decode_scratch(logits, model, weights->output, scratch->output_norm, scratch);
+        return;
+    }
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * n_hc;
 
