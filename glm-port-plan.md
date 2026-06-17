@@ -464,6 +464,16 @@ stayed within mmap/CPU-light bounds.
   context: SSD streaming + 8-bit KV (§3b) once the Metal forward runs.
 
 ## 6. Status log
+
+- 2026-06-17 ~01:25: **Q2 validated through the FULL forward + Q2-vs-Q4 comparison.** Q2 first-token-test
+  (all 78 layers incl IQ2_XXS gate/up + Q2_K down MoE) **completed cleanly**: finite logits min=-8.98
+  max=27.19 rms=2.12, top `[gMASK]` (27.19) — consistent with Q4's full-forward behavior (top `[gMASK]`
+  28.7, rms 2.20). Q2 (235 GB) ran clean where the Q4 (430 GB) CPU forward again hit a transient
+  memory/VM kill (no output) — confirming Q2 fits RAM and is the better full-run target. **Q2 quality
+  preserved at the gross level** (same sequence-start prediction for OOD bare input, similar logit
+  magnitudes through the quantized MoE); a rigorous Q2-vs-Q4 quality delta needs proper `[gMASK]<sop>`
+  prefill + a reference (awaits the batch path). **RUN COMPLETE** — loop ended. Both GGUFs delivered;
+  forward validated end-to-end on CPU; Metal port + multi-token generation documented in §7/§7b/§6b.
 - 2026-06-16: Investigation complete. Confirmed GLM-5.2 = `glm_moe_dsa` (MLA+DSA+MoE, DeepSeek-V4 cousin). Verified config, geometry map, GLM chat template. Identified **Hyper-Connections removal (R1)** as the gating risk (missing from porting.md). Branch `ds4-glm` ready locally; notible checkout exists on `main`; model ~18% downloaded.
 - 2026-06-16: Per user, added **Q2 and Q4 both as Phase 4 build targets** (Q4 = SSD-streaming-only on 256 GB) for a real quality/speed comparison, and the **§3b M1 memory-fit study** (quantized KV is the key lever for Q2 + large context on 256 GB). Pushed groundwork to `origin`; checked out `ds4-glm` on notible (sync loop proven).
 - 2026-06-16: Ran two spikes. **R1 (HC) resolved → bypass path, ~6-8 sites, not a rewrite (§3c).** Attention/FFN deltas mapped: o_proj LOW, dense-first-3 LOW-MED, q/kv up-proj MED (§3c). Captured **verified GLM tensor schema from shard headers (§2b)** — key converter job is stacking 256 per-expert tensors. Download now ~73% (207/282 shards). Next: converter skeleton + `DS4_SHAPE_GLM`/HC-bypass scaffolding once `index.json` lands (router/shared/MTP names).
