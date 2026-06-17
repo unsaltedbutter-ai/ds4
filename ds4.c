@@ -15138,6 +15138,10 @@ static bool metal_graph_encode_decode_layer_glm(
     bool ok = true;
 #define GLM_STEP(label) do { if (!ok) { fprintf(stderr, "ds4: GLM decode layer %u: %s failed\n", il, (label)); return false; } } while (0)
 
+    /* g->ffn_out is allocated lazily by the DeepSeek path; the GLM path always
+     * materializes the FFN output into it before the residual add. */
+    if (!metal_graph_ensure_ffn_out(g)) { fprintf(stderr, "ds4: GLM decode layer %u: ffn_out alloc failed\n", il); return false; }
+
     /* hc_pre (attn): GLM bypasses HC, so the sublayer input is RMSNorm(residual)
      * and the residual itself is cur_hc. */
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm, g->cur_hc, model->map, model->size,
