@@ -7542,8 +7542,11 @@ static void layer_router_probs_one(
     float logits[DS4_MAX_EXPERT];
 
     matvec_any(logits, model, layer->ffn_gate_inp, x);
-    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
-        probs[i] = sqrtf(softplus_stable(logits[i]));
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM scoring_func = sigmoid (noaux_tc); DeepSeek V4 uses sqrt(softplus). */
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) probs[i] = sigmoid_stable(logits[i]);
+    } else {
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) probs[i] = sqrtf(softplus_stable(logits[i]));
     }
 }
 
@@ -10326,7 +10329,9 @@ static void layer_forward_self_one(
     f16_round_inplace_cpu(kv, DS4_N_HEAD_DIM);
 
     layer_attention_one(heads, model, layer, q, kv);
-    rope_tail_layer_inplace(heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
+    /* GLM's value context is the rope-free c_kv (n_value_dim wide); no inverse rope. */
+    if (DS4_MODEL_VARIANT != DS4_VARIANT_GLM)
+        rope_tail_layer_inplace(heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
     layer_grouped_out_one(attn_out, model, layer, heads);
     hc_post_one(after_attn_hc, attn_out, attn_residual, post, comb, DS4_N_EMBD, n_hc);
 
