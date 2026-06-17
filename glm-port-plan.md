@@ -292,7 +292,7 @@ Legend: [x] done · [~] partial · [ ] not started.
 
 ### Phase 3 — Metal + multi-token + server ← **WE ARE HERE**
 - [x] **Metal single-token decode graph (HC=1) — VALIDATED vs CPU** (2026-06-17): `--metal-graph-full-test` gpu_top==cpu_top==154822, logits rms-diff ~0.01. On GPU: HC bypass, 576/512 absorbed attention (no sinks, kq 1/√256, plain o_proj, partial kv_a_norm, no inverse-rope), dense FFN <3, shared expert, output head. Kernel: `kernel_flash_attn_ext_vec_f16_dk576_dv512` (NE=2).
-- [ ] **8-expert Metal routed MoE — #1 remaining for SPEED** (experts ≈97% FLOPs). Currently CPU (`metal_graph_glm_cpu_routed_moe`) because the Metal MoE path is 6-experts-only (`selected_ids[6]`, `sum6` down-reduction). Needs `sum8` kernels + dispatch rework (task tracked).
+- [x] **8-expert Metal routed MoE — VALIDATED vs CPU** (2026-06-17): routed experts (≈97% FLOPs) now run on the GPU. The baseline id-based MoE path turned out to be already n_expert-general (per-`(expert,token)` dispatch; `ds4_gpu_encode_moe_sum_experts` reduces any count via a binary add chain) — **no `sum8` kernel was needed**; the only 6-hardwiring was the `n_expert > 6` guard, now `> DS4_GPU_MAX_EXPERT_USED`. GLM decode layer selects on the CPU (`metal_graph_glm_cpu_router`, sigmoid noaux_tc top-8 -> `g->router_selected/weights`) and runs experts on Metal via `ds4_gpu_routed_moe_one_tensor`. `--metal-graph-full-test` on Q2: gpu_top==cpu_top==154822, logits rms-diff 0.0136. `DS4_GLM_CPU_ROUTED_MOE=1` forces the v1 all-CPU path (A/B fallback). DeepSeek 6-expert fast paths bit-identical.
 - [ ] **Multi-token generation:** CPU batch/decode + KV-cache full-attention (`n_swa=0`); the Metal prefill/batch path (`metal_graph_encode_layer_batch`); §7b. Decode-path single-token is done; prefill is not GLM-adapted.
 - [ ] Tokenizer + chat template (`[gMASK]<sop>` framing, reasoning-effort) + multi-EOS + `<tool_call>` render/parse (server-facing; §1b)
 - [ ] 🔴 Server answers a real prompt end to end + measure tokens/sec on notible
@@ -546,6 +546,34 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (**8-expert Metal routed MoE VALIDATED vs CPU — routed experts now on the GPU**): The
+  routed MoE (≈97% of FLOPs) was the #1 speed item; it ran on the CPU because
+  `ds4_gpu_routed_moe_one_tensor` rejected `n_expert > 6` and GLM routes 8. **The fix was far smaller
+  than the handoff feared:** the baseline id-based MoE path is already n_expert-general (the
+  gate/up/down `mul_mv_id` kernels dispatch one threadgroup-set per `(expert, token)` via
+  `pairs = nei0*nei1`, and `ds4_gpu_encode_moe_sum_experts` already reduces any expert count with a
+  binary add chain for `n_expert != 6`). So **no `sum8`/`group8` reduction kernel and no dispatch
+  rework were needed** (correcting the §7/handoff framing) — the only 6-hardwiring in GLM's path was
+  the entry guard. Changes: (1) ds4_metal.m guard `n_expert > 6` -> `> DS4_GPU_MAX_EXPERT_USED` (8) and
+  `selected_ids[6]` -> `[DS4_GPU_MAX_EXPERT_USED]` (defensive; the slot/stream arrays it feeds are all
+  `n_expert==6`-gated, so DeepSeek is bit-identical and only GLM's n_expert=8 newly passes to the
+  generic baseline). (2) ds4.c `metal_graph_glm_cpu_router` mirrors the DeepSeek
+  `metal_graph_decode_cpu_router` but uses GLM routing (`layer_topk_selected_experts`: sigmoid
+  noaux_tc + `exp_probs_b` bias + top-8 + normalized x2.5), one sync/MoE-layer to read `ffn_norm`,
+  writing `g->router_selected/weights`. (3) the GLM decode layer's MoE branch now calls
+  `ds4_gpu_routed_moe_one_tensor` (same wiring as the DeepSeek caller: `g->routed_gate/up/mid/down`
+  scratch, `ffn_{gate,up,down}_exps` offsets/types, IQ2_XXS gate/up + Q2_K down, clamp
+  `DS4_SWIGLU_CLAMP_EXP`) instead of `metal_graph_glm_cpu_routed_moe`; `DS4_GLM_CPU_ROUTED_MOE=1`
+  forces the v1 all-CPU path for A/B. **Validation** (`--metal-graph-full-test` on `glm-5.2-q2.gguf`,
+  `-c 2048`, prod server stopped then restarted): **gpu_top==cpu_top==154822** (`[gMASK]`),
+  gpu_top_logit 27.1759 vs cpu 27.1943, logits max-diff 0.0648 / rms 0.0136 (vs 0.0110 when the MoE
+  was CPU-uploaded -- the small rise is the expected GPU/CPU expert-arithmetic noise, top token
+  unchanged with healthy margin). `make ds4` clean on both machines; DeepSeek/CUDA paths untouched
+  (no new public GPU entry point, so no new CUDA stub). **Remaining for end-to-end tokens/sec:** the
+  router still costs one GPU<->CPU sync per MoE layer (a GPU sigmoid router per §7c.4 would remove it),
+  and multi-token generation (CPU batch/decode + KV full-attention + Metal prefill) is still needed to
+  actually measure tokens/sec (single-token `--metal-graph-full-test` is load-dominated, not a t/s
+  benchmark).
 - 2026-06-17 (**Metal decode forward VALIDATED end-to-end vs CPU on the real Q2 model**): The GLM
   single-token Metal graph now runs all 78 layers and matches the validated CPU forward. Natural
   (non-teacher-forced) `--metal-graph-full-test` on `glm-5.2-q2.gguf`: **gpu_top == cpu_top == 154822**
