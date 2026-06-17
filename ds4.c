@@ -135,6 +135,7 @@ enum {
 typedef enum {
     DS4_VARIANT_FLASH = 0,
     DS4_VARIANT_PRO   = 1,
+    DS4_VARIANT_GLM   = 2,
 } ds4_variant;
 
 typedef struct {
@@ -156,6 +157,7 @@ typedef struct {
     uint32_t n_expert_shared;
     uint32_t n_ff_exp;
     uint32_t n_hash_layer;
+    uint32_t n_first_k_dense;   /* GLM: first k layers are dense MLP (0 for Flash/Pro) */
     uint32_t n_swa;
     uint32_t n_indexer_head;
     uint32_t n_indexer_head_dim;
@@ -248,6 +250,48 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
+/* GLM-5.2 (glm_moe_dsa): MLA+DSA+MoE cousin of DeepSeek V4, run with HC bypassed,
+ * absorbed MLA (key=576=512 c_kv+64 rope, value=512), plain o_proj, dense first 3
+ * layers, full attention (no compression). Values must match the GLM GGUF metadata
+ * authored by gguf-tools/glm-quantize.c (see glm-port-plan.md sec 5c). */
+static const ds4_shape DS4_SHAPE_GLM = {
+    .name = "GLM-5.2",
+    .variant = DS4_VARIANT_GLM,
+    .n_layer = 78,
+    .n_embd = 6144,
+    .n_vocab = 154880,
+    .n_head = 64,
+    .n_head_kv = 1,
+    .n_head_dim = 576,
+    .n_value_dim = 512,
+    .n_rot = 64,
+    .n_out_group = 1,
+    .n_lora_q = 2048,
+    .n_lora_o = 0,
+    .n_expert = 256,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 2048,
+    .n_hash_layer = 0,
+    .n_first_k_dense = 3,
+    .n_swa = 0,
+    .n_indexer_head = 32,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 2048,
+    .n_hc = 1,
+    .n_hc_sinkhorn_iter = 0,
+    .rms_eps = 1e-5f,
+    .hc_eps = 1e-5f,
+    .expert_weight_scale = 2.5f,
+    .swiglu_clamp_exp = 30.0f,
+    .rope_freq_base = 8000000.0f,
+    .rope_scale_factor = 1.0f,
+    .rope_yarn_beta_fast = 1.0f,
+    .rope_yarn_beta_slow = 1.0f,
+    .compress_rope_freq_base = 8000000.0f,
+    .rope_orig_ctx = 1048576,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .variant = DS4_VARIANT_FLASH,
@@ -305,6 +349,7 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_EXPERT_SHARED           (g_ds4_shape.n_expert_shared)
 #define DS4_N_FF_EXP                  (g_ds4_shape.n_ff_exp)
 #define DS4_N_HASH_LAYER              (g_ds4_shape.n_hash_layer)
+#define DS4_N_FIRST_K_DENSE           (g_ds4_shape.n_first_k_dense)
 #define DS4_N_SWA                     (g_ds4_shape.n_swa)
 #define DS4_N_INDEXER_HEAD            (g_ds4_shape.n_indexer_head)
 #define DS4_N_INDEXER_HEAD_DIM        (g_ds4_shape.n_indexer_head_dim)
@@ -637,6 +682,8 @@ static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
     case DS4_VARIANT_PRO:
         if (il < 2) return 128u;
         return (il & 1u) == 0 ? 4u : 128u;
+    case DS4_VARIANT_GLM:
+        return 0u;   /* GLM runs uncompressed (no trained KV compressor) */
     default:
         ds4_die("unsupported DeepSeek4 model variant");
     }
@@ -3776,6 +3823,17 @@ static void ds4_select_shape_from_metadata(
                                    n_indexer_head_dim, n_indexer_top_k, n_hc,
                                    n_hc_sinkhorn_iter)) {
         g_ds4_shape = DS4_SHAPE_PRO;
+        return;
+    }
+    if (ds4_shape_matches_metadata(&DS4_SHAPE_GLM,
+                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                   n_lora_o, n_out_group, n_expert,
+                                   n_expert_used, n_ff_exp, n_expert_shared,
+                                   n_hash_layer, n_swa, n_indexer_head,
+                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                   n_hc_sinkhorn_iter)) {
+        g_ds4_shape = DS4_SHAPE_GLM;
         return;
     }
 
