@@ -25851,8 +25851,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
-    if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
+    /* Select the model shape first so the variant is known to vocab_load
+     * (GLM and DeepSeek use different special tokens). */
     config_validate_model(&e->model);
+    if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
         fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
         ds4_engine_close(e);
