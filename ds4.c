@@ -7393,6 +7393,37 @@ static void layer_shared_ffn_one(
     free(gate);
 }
 
+/* GLM dense layers (il < first_k_dense): a plain Q8_0 SwiGLU MLP at the dense
+ * intermediate size, replacing routed MoE + shared expert for those layers. */
+static void layer_dense_ffn_one(
+        float             * out,
+        const ds4_model   * model,
+        const ds4_layer_weights * layer,
+        const float       * x) {
+    const uint64_t ff = layer->ffn_gate_dense->dim[1];
+    const uint64_t in_dim = layer->ffn_gate_dense->dim[0];
+    float *gate = xmalloc((size_t)ff * sizeof(gate[0]));
+    float *up = xmalloc((size_t)ff * sizeof(up[0]));
+    float *mid = xmalloc((size_t)ff * sizeof(mid[0]));
+    const uint64_t blocks = (in_dim + 31) / 32;
+    int8_t *xq = xmalloc((size_t)blocks * 32);
+    float *xscale = xmalloc((size_t)blocks * sizeof(xscale[0]));
+
+    quantize_q8_0_activation(x, xq, xscale, in_dim);
+    matvec_q8_0_pair_prequant(gate, up, model,
+                              layer->ffn_gate_dense,
+                              layer->ffn_up_dense,
+                              xq, xscale);
+    swiglu(mid, gate, up, ff, DS4_SWIGLU_CLAMP_EXP);
+    matvec_q8_0(out, model, layer->ffn_down_dense, mid);
+
+    free(xscale);
+    free(xq);
+    free(mid);
+    free(up);
+    free(gate);
+}
+
 static void layer_shared_ffn_one_decode_scratch(
         float                  * out,
         const ds4_model        * model,
@@ -8030,6 +8061,10 @@ static void layer_ffn_one(
     }
 
     t0 = profile ? now_sec() : 0.0;
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM && il < DS4_N_FIRST_K_DENSE) {
+        /* GLM dense layers: plain SwiGLU MLP (no routed MoE / shared expert). */
+        layer_dense_ffn_one(ffn_out, model, layer, norm);
+    } else {
     layer_routed_moe_one(moe, model, layer, norm, il, token, DS4_SWIGLU_CLAMP_EXP, trace);
     if (profile) t_routed = now_sec() - t0;
     if (trace) {
@@ -8049,6 +8084,7 @@ static void layer_ffn_one(
     t0 = profile ? now_sec() : 0.0;
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
         ffn_out[i] = moe[i] + shared[i];
+    }
     }
     cpu_directional_steering_project_rows(ffn_out, steering_dirs, il, 1, steering_scale);
     if (trace) {
