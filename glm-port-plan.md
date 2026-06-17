@@ -425,6 +425,44 @@ test harnesses) on a few tokens — they should match within quant/precision noi
 - The first-token-test top token for a bare OOD single token is `[gMASK]` (GLM's sequence-start token) —
   expected, not a bug; a real continuation needs `[gMASK]<sop>` framing + prefill.
 
+## 6b. FINAL SUMMARY (end of 2026-06-16/17 ~8h unattended run)
+
+**Outcome: GLM-5.2 loads and runs (forward pass) on ds4, validated end-to-end on the real 753 B model
+on the CPU backend. Two quantized GGUFs were produced as deliverables.** Everything is on branch
+`ds4-glm` (local + `notible:~/Documents/ds4-glm`), DeepSeek Flash/Pro path untouched (all GLM behavior
+gated on `DS4_MODEL_VARIANT == DS4_VARIANT_GLM`). Prod server port 8085 was **never stopped** — all work
+stayed within mmap/CPU-light bounds.
+
+### What works (validated)
+- **Converter** `gguf-tools/glm-quantize.c` (threaded ~20×): authors a full GLM GGUF from HF bf16
+  safetensors + config + tokenizer — metadata (`deepseek4.*` namespace), GLM BPE tokenizer
+  (154880 tokens + 321649 merges), absorbed-MLA attention (folds `kv_b` into `q_b`/`o_proj` —
+  proven exact in `gguf-tools/check_mla_absorption.py`), stacked routed experts. Modes: default **Q4**
+  (Q4_K experts) and **`--q2`** (IQ2_XXS gate/up + Q2_K down + synthetic importance).
+- **Deliverables:** `notible:/Volumes/4TB-1/glm-5.2-q4.gguf` (408.7 GiB) and `glm-5.2-q2.gguf` (218.9 GiB).
+  Recipe both: F16 embed/output/router, Q8_0 attn+shared+dense, F32 norms, experts Q4_K **or** IQ2_XXS+Q2_K.
+- **Load path:** `ds4 --inspect` binds + validates all 1236 tensors on both real GGUFs (correct shape
+  78L/6144/head_dim 576/256 experts, 753 B params, correct types).
+- **Full CPU forward:** `ds4 --cpu --first-token-test` runs all 78 layers (dense 0-2 + MoE 3-77 with
+  sigmoid noaux_tc routing) on the real model → finite, sane logits. The #1 risk (forward correctness)
+  is retired on CPU. RoPE verified interleaved (matches GLM), correct at all positions.
+- **Engine deltas in `ds4.c`** (all variant-gated): `DS4_SHAPE_GLM` + shape selection; HC bypass (single
+  residual stream via `hc_pre_from_state_one_scratch`); absorbed attention key=576/value=512, no
+  attn_sinks, `kq_scale=1/√256`, partial `kv_a_norm`, skip inverse-rope on value; plain `attn_output`;
+  dense FFN for `il<3`; sigmoid noaux_tc router; output-head HC-skip; GLM vocab special tokens;
+  `config_validate_model` before `vocab_load`; **`DS4_MAX_EXPERT_USED` 6→8** (GLM uses 8/tok — was a
+  stack overflow). Plus converter type fixes (F16 embed/router, Q4_K/IQ2_XXS+Q2_K experts).
+
+### What remains (to run GLM *usefully*, i.e. at speed / multi-token)
+- **Metal-graph port** — the main remaining work; CPU forward is correct but slow. Every site mapped in
+  §7 (HC bypass, 576/512 attention kernel, plain o_proj, dense FFN, sigmoid router, output head, raw-KV).
+- **CPU batch/decode + KV-cache** for real multi-token generation (§7b): batch attention variants + the
+  decode-scratch fns need the GLM deltas, and the KV cache must do full attention (`n_swa=0`). Not started
+  because CPU test cycles on the 430 GB model are 5-15 min — too slow to debug-iterate in-budget.
+- **Exactness/quality:** functional but not bit-checked vs a reference; MoE routing matches noaux_tc on
+  inspection; `kq_scale=1/√256` is the standard MLA value (high confidence). For Q2 on 256 GB with big
+  context: SSD streaming + 8-bit KV (§3b) once the Metal forward runs.
+
 ## 6. Status log
 - 2026-06-16: Investigation complete. Confirmed GLM-5.2 = `glm_moe_dsa` (MLA+DSA+MoE, DeepSeek-V4 cousin). Verified config, geometry map, GLM chat template. Identified **Hyper-Connections removal (R1)** as the gating risk (missing from porting.md). Branch `ds4-glm` ready locally; notible checkout exists on `main`; model ~18% downloaded.
 - 2026-06-16: Per user, added **Q2 and Q4 both as Phase 4 build targets** (Q4 = SSD-streaming-only on 256 GB) for a real quality/speed comparison, and the **§3b M1 memory-fit study** (quantized KV is the key lever for Q2 + large context on 256 GB). Pushed groundwork to `origin`; checked out `ds4-glm` on notible (sync loop proven).
