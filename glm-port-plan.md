@@ -405,6 +405,26 @@ Shared fixes already in place (help both backends): `DS4_SHAPE_GLM`, `DS4_MAX_EX
 Validation: once the Metal forward runs, compare its logits to the CPU forward (ds4 has metal-graph-vs-cpu
 test harnesses) on a few tokens — they should match within quant/precision noise.
 
+## 7b. Known gaps / cautions for whoever continues
+
+- **RoPE for positions >0 is UNVALIDATED.** All current validation is single-token at position 0, where the
+  rope rotation angle is 0 → rope = identity. So the head-test / first-token-test do NOT exercise rope.
+  GLM config has `rope_interleave: true` (interleaved pairs); ds4's `rope_tail`/`kernel_dsv4_rope_tail_f32`
+  may apply split-half (NeoX) rotation. **Verify the rope pairing convention before trusting multi-token
+  generation** — a mismatch is invisible at pos 0 but corrupts attention at pos>0. (rope θ=8e6 is set.)
+- **CPU generation (prefill+decode) is NOT done.** `generate_raw_swa_cpu` → `prefill_layer_major_cpu` + a
+  decode loop use BATCH attention variants (ds4.c ~9086/9149/9215 `layer_attention_prefix_batch`, ~9549
+  `layer_attention_raw_swa_batch`) and decode-scratch fns (`layer_kv_projection_normed_one_decode_scratch`
+  ~6971, `layer_grouped_out_one_decode_scratch`) that still need the GLM deltas (no sinks, value=512 / key=576,
+  kq_scale 1/√256, skip inverse-rope, plain o_proj, partial kv_a_norm). PLUS the **KV cache**: GLM `n_swa=0`
+  means the raw-KV sliding window retains 0 rows → must make GLM retain ALL positions (full attention). Until
+  these land, only the single-token forward runs.
+- **MoE routing math** (sigmoid + `exp_probs_b` bias + flat top-8 + normalized×2.5) matches GLM's noaux_tc on
+  inspection and produces finite logits, but is **not bit-checked** vs a reference. `kq_scale=1/√256` is the
+  standard MLA value (high confidence) but unverified-exact.
+- The first-token-test top token for a bare OOD single token is `[gMASK]` (GLM's sequence-start token) —
+  expected, not a bug; a real continuation needs `[gMASK]<sop>` framing + prefill.
+
 ## 6. Status log
 - 2026-06-16: Investigation complete. Confirmed GLM-5.2 = `glm_moe_dsa` (MLA+DSA+MoE, DeepSeek-V4 cousin). Verified config, geometry map, GLM chat template. Identified **Hyper-Connections removal (R1)** as the gating risk (missing from porting.md). Branch `ds4-glm` ready locally; notible checkout exists on `main`; model ~18% downloaded.
 - 2026-06-16: Per user, added **Q2 and Q4 both as Phase 4 build targets** (Q4 = SSD-streaming-only on 256 GB) for a real quality/speed comparison, and the **§3b M1 memory-fit study** (quantized KV is the key lever for Q2 + large context on 256 GB). Pushed groundwork to `origin`; checked out `ds4-glm` on notible (sync loop proven).
