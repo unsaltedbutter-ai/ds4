@@ -25506,7 +25506,10 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
     float *attn_heads = xmalloc((size_t)q_dim * sizeof(attn_heads[0]));
     layer_attention_one(attn_heads, model, layer0, q0, kv0);
     print_vec_stats("blk.0 attn_heads", attn_heads, q_dim);
-    rope_tail_layer_inplace(attn_heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, (uint32_t)(prompt->len - 1), 0, true);
+    /* GLM's value context is the rope-free c_kv (n_value_dim wide), so there is
+     * no rotated tail to invert before the output projection. */
+    if (DS4_MODEL_VARIANT != DS4_VARIANT_GLM)
+        rope_tail_layer_inplace(attn_heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, (uint32_t)(prompt->len - 1), 0, true);
 
     float *attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_out[0]));
     layer_grouped_out_one(attn_out, model, layer0, attn_heads);
