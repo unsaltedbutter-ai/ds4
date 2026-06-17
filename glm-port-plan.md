@@ -162,7 +162,8 @@ layer; ds4 expects them stacked `[blocks, features, expert_id]`. **Confirmed by
 bias `mlp.gate.e_score_correction_bias` → `exp_probs_b.bias`; shared expert
 `mlp.shared_experts.{gate,up,down}_proj` → `ffn_*_shexp`. DSA indexer weights live on only
 ~20/78 layers (the `full` indexer layers; `shared` layers reuse them — matches IndexShare).
-Still pending the last shard: final `model.norm.weight` and MTP (`nextn`) tensor names.
+Download complete (2026-06-16): `model.norm.weight` present; MTP (`nextn`) is **layer index 78**
+with `eh_proj`, `enorm`, `hnorm`, `shared_head.norm` (+ its own attention/experts) — for Phase 5.
 
 ---
 
@@ -240,10 +241,16 @@ HC state, so no payload version bump for this.
 - **A. Output projection — LOW.** Replace grouped 2-stage output LoRA (`layer_grouped_out_one`
   `ds4.c:7094-7142`; Metal `ds4_metal.m:16051-16380`) with a single o_proj matmul
   `[64*256=16384 → 6144]`. Reuses existing matmul; ~5-10 CPU lines, no new kernel.
-- **B. Q/KV up-projection — MED (the real attention work).** GLM per-head `qk_nope=192`/`v=256`
-  vs ds4's absorbed 512 latent; `q_lora` 1024→2048, `q_b`→16384, `kv_b`→`64*448=28672`
-  (`ds4.c:6742-6794`, Metal `~17357-17612`). Open: confirm whether ds4 runs absorbed MLA and
-  how `kv_b` folds; thread GLM's nope/value dims + rope indexing.
+- **B. Q/KV up-projection — MED, now characterized (correction to earlier "mostly converter").**
+  ds4 packs each head as `n_head_dim=512 = 448 nope + 64 rope (tail)`, value = the same latent,
+  grouped output LoRA (`ds4.c:6742-6794, 7057-7112`; rope tail `6856-6889`). GLM keeps
+  `kv_lora_rank=512` **plus** a separate `qk_rope=64` (`kv_a_proj_with_mqa` is 576-wide) and
+  `v_head_dim=256` ≠ key dim. So GLM in absorbed form ⇒ engine **`n_head_dim=576` (512 c_kv +
+  64 rope)**, **`n_value_dim=512`**, **partial `kv_a_norm` (512 of 576)**, rope on the tail 64.
+  Converter folds `kv_b_k`→`q_b` (giving `attn_q_b [2048, 64*576]`) and `kv_b_v`→output (plain
+  absorbed o_proj); `attn_kv` maps directly from GLM `kv_a_proj_with_mqa`. So this is real
+  engine work (head_dim/value split + partial norm), not just a converter fold. **Resolve the
+  exact fold + dims empirically vs a CPU-slice transformers reference (weights now local).**
 - **C. Dense first-3 layers — LOW-MED.** No dense FFN path exists today (only routed-MoE +
   shared-expert SwiGLU `layer_shared_ffn_one` `ds4.c:7184-7216`, intermediate hardcoded to
   `n_ff_exp`). Add `layer_dense_ffn_one()` reusing the SwiGLU kernel at `intermediate=12288`,
@@ -315,3 +322,4 @@ HC state, so no payload version bump for this.
 - 2026-06-16: Ran two spikes. **R1 (HC) resolved → bypass path, ~6-8 sites, not a rewrite (§3c).** Attention/FFN deltas mapped: o_proj LOW, dense-first-3 LOW-MED, q/kv up-proj MED (§3c). Captured **verified GLM tensor schema from shard headers (§2b)** — key converter job is stacking 256 per-expert tensors. Download now ~73% (207/282 shards). Next: converter skeleton + `DS4_SHAPE_GLM`/HC-bypass scaffolding once `index.json` lands (router/shared/MTP names).
 - 2026-06-16: Recorded the **port-8085 server-down gate** (§0): converter/build/source work keeps the prod server up; only loading/running GLM on notible Metal (imatrix, first forward pass, Q2/Q4 runs) needs it down — will flag before each. Built **`gguf-tools/glm-quantize.c` skeleton**; `--dry-run` over 255 shards validated the GLM→ds4 map and **confirmed router/shared/noaux_tc-bias names** (§2b) + the ~20/78-layer IndexShare indexer. Gaps are just download-incompleteness + final `model.norm` (last shard). Converter is standalone (no GLM template GGUF exists). Next: converter body (dequant + MLA absorption + expert stacking + GGUF authoring, Q8 first).
 - 2026-06-16: Built the converter's **safetensors reader** (`stdb`: scans shard headers directly, no `index.json` needed; bf16/f32 → f32) with a `--read` mode. **Validated on real tensors** (norm gains all-positive 0.004-0.22; `q_a_proj`/expert weights symmetric ±0.17, mean≈0 → bf16 decode correct). Next design step: pin the **GGUF schema contract** (metadata + tensor set) jointly with the engine loader, and resolve the absorbed-MLA representation (how GLM's un-absorbed `kv_b` folds into ds4's `attn_q_b`/`attn_kv`/`attn_output`) by reading ds4's attention forward — that gates the converter writer and the engine attention changes.
+- 2026-06-16: **Model download complete** (1.4 TB, 282 shards, 59,585 tensors); `tokenizer.json` + `index.json` now local. `glm-quantize --dry-run` now shows the full GLM→ds4 map satisfied (only the by-design indexer SKIP is partial). MTP = layer 78 (`eh_proj`/`enorm`/`hnorm`/`shared_head.norm`). **Absorption characterized (§3c B):** GLM ⇒ engine `n_head_dim=576` (512 c_kv + 64 rope), `n_value_dim=512`, partial `kv_a_norm`; converter folds `kv_b`. This is real engine work, not just a converter fold — **next: resolve the exact fold/dims against a CPU-slice transformers reference, then write the GGUF schema contract** (gates the writer + engine attention). Mechanical converter pieces (config→metadata, tokenizer arrays, GGUF writer, expert stacking, quant) are unblocked and can proceed for non-attention tensors in parallel.
