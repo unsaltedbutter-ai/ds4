@@ -6199,7 +6199,12 @@ int ds4_gpu_init(void) {
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
-    if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
+    if (bytes > (uint64_t)NSUIntegerMax) return NULL;
+    /* A zero-length Metal buffer is invalid (newBufferWithLength:0 returns nil).
+     * Hand back a minimal placeholder so disabled-feature buffers that compute to
+     * size 0 (e.g. GLM's absent output-LoRA / compressor / indexer scratch, which
+     * the GLM graph never reads) still satisfy non-NULL allocation checks. */
+    if (bytes == 0) bytes = 1;
 
     @autoreleasepool {
         DS4MetalTensor *tensor = [DS4MetalTensor new];
