@@ -52,6 +52,12 @@ static void *xrealloc(void *p, size_t n) {
     return q;
 }
 
+static void *xcalloc(size_t n, size_t sz) {
+    void *p = calloc(n ? n : 1, sz ? sz : 1);
+    if (!p) die("out of memory");
+    return p;
+}
+
 static char *xstrndup(const char *s, size_t n) {
     char *p = xmalloc(n + 1);
     memcpy(p, s, n);
@@ -182,6 +188,69 @@ static int64_t json_i64(const json_doc *d, int tok) {
     memcpy(tmp, d->js + d->v[tok].start, (size_t)n);
     tmp[n] = '\0';
     return strtoll(tmp, NULL, 10);
+}
+
+/* File + JSON-string helpers for config/tokenizer parsing. */
+static char *read_file(const char *path, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "glm-quantize: cannot open %s\n", path); exit(1); }
+    fseeko(f, 0, SEEK_END);
+    off_t sz = ftello(f);
+    fseeko(f, 0, SEEK_SET);
+    char *b = xmalloc((size_t)sz + 1);
+    if (sz && fread(b, 1, (size_t)sz, f) != (size_t)sz) die("short file read");
+    b[sz] = '\0';
+    fclose(f);
+    if (len) *len = (size_t)sz;
+    return b;
+}
+static int hex4(const char *p) {
+    int v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = p[i];
+        int dgt = (c>='0'&&c<='9')?c-'0':(c>='a'&&c<='f')?c-'a'+10:(c>='A'&&c<='F')?c-'A'+10:0;
+        v = v * 16 + dgt;
+    }
+    return v;
+}
+static int utf8_enc(unsigned cp, char *o) {
+    if (cp < 0x80) { o[0]=(char)cp; return 1; }
+    if (cp < 0x800) { o[0]=(char)(0xC0|(cp>>6)); o[1]=(char)(0x80|(cp&0x3F)); return 2; }
+    if (cp < 0x10000) { o[0]=(char)(0xE0|(cp>>12)); o[1]=(char)(0x80|((cp>>6)&0x3F)); o[2]=(char)(0x80|(cp&0x3F)); return 3; }
+    o[0]=(char)(0xF0|(cp>>18)); o[1]=(char)(0x80|((cp>>12)&0x3F)); o[2]=(char)(0x80|((cp>>6)&0x3F)); o[3]=(char)(0x80|(cp&0x3F)); return 4;
+}
+/* JSON string token -> unescaped UTF-8 (byte-level BPE tokens have no embedded NUL). */
+static char *json_unescape(const json_doc *d, int tok) {
+    int s = d->v[tok].start, e = d->v[tok].end;
+    const char *p = d->js;
+    char *out = xmalloc((size_t)(e - s) * 3 + 1);
+    size_t o = 0;
+    for (int i = s; i < e; i++) {
+        char c = p[i];
+        if (c != '\\') { out[o++] = c; continue; }
+        if (++i >= e) break;
+        char x = p[i];
+        switch (x) {
+            case 'n': out[o++]='\n'; break;
+            case 't': out[o++]='\t'; break;
+            case 'r': out[o++]='\r'; break;
+            case 'b': out[o++]='\b'; break;
+            case 'f': out[o++]='\f'; break;
+            case 'u':
+                if (i + 4 < e) {
+                    int cp = hex4(p + i + 1); i += 4;
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < e && p[i+1]=='\\' && p[i+2]=='u') {
+                        int lo = hex4(p + i + 3); i += 6;
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    }
+                    o += (size_t)utf8_enc((unsigned)cp, out + o);
+                }
+                break;
+            default: out[o++] = x; break;  /* \" \\ \/ and any other */
+        }
+    }
+    out[o] = '\0';
+    return out;
 }
 
 /* =====
@@ -406,6 +475,14 @@ static void kv_arr_f32(buf *b, int *nk, const char *k, const float *v, uint64_t 
     b_str(b,k); b_u32(b,GT_ARR); b_u32(b,GT_F32); b_u64(b,n);
     for (uint64_t i=0;i<n;i++) bput(b,&v[i],4); (*nk)++;
 }
+static void kv_arr_str(buf *b, int *nk, const char *k, char **v, uint64_t n) {
+    b_str(b,k); b_u32(b,GT_ARR); b_u32(b,GT_STR); b_u64(b,n);
+    for (uint64_t i=0;i<n;i++) b_str(b,v[i]); (*nk)++;
+}
+static void kv_arr_i32(buf *b, int *nk, const char *k, const int32_t *v, uint64_t n) {
+    b_str(b,k); b_u32(b,GT_ARR); b_u32(b,GT_I32); b_u64(b,n);
+    for (uint64_t i=0;i<n;i++) bput(b,&v[i],4); (*nk)++;
+}
 
 /* GLM nominal float constants (must equal DS4_SHAPE_GLM). YaRN/compression/HC are
  * off for GLM, so their bases/epsilons are nominal placeholders. */
@@ -460,10 +537,95 @@ static void emit_metadata(buf *kv, int *nk) {
     kv_arr_f32(kv, nk, "deepseek4.swiglu_clamp_exp", sc, GLM_N_LAYER);
 }
 
-static void write_gguf_meta(const char *out) {
+/* GGUF token types (llama.cpp convention). */
+#define GLM_VOCAB 154880
+enum { TOK_NORMAL=1, TOK_UNKNOWN=2, TOK_CONTROL=3, TOK_USER=4, TOK_UNUSED=5 };
+
+/* Author tokenizer.ggml.* from tokenizer.json (GPT-2 byte-level BPE). */
+static void emit_tokenizer(buf *kv, int *nk, const char *hf_dir) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/tokenizer.json", hf_dir);
+    size_t len = 0;
+    char *text = read_file(path, &len);
+    json_doc d = json_parse_text(text, len);
+
+    int model  = json_obj_get(&d, 0, "model");
+    if (model < 0) die("tokenizer.json: no model");
+    int vocab  = json_obj_get(&d, model, "vocab");
+    int merges = json_obj_get(&d, model, "merges");
+    int added  = json_obj_get(&d, 0, "added_tokens");
+    if (vocab < 0 || merges < 0) die("tokenizer.json: missing vocab/merges");
+
+    char **tokens   = xcalloc(GLM_VOCAB, sizeof(char *));
+    int32_t *ttype  = xmalloc(GLM_VOCAB * sizeof(int32_t));
+    for (int i = 0; i < GLM_VOCAB; i++) ttype[i] = TOK_UNUSED;
+
+    /* vocab: { "<token>": id } */
+    for (int i = vocab + 1; i < d.len && d.v[i].parent == vocab;) {
+        int k = i, v = i + 1;
+        if (v >= d.len || d.v[v].parent != vocab) break;
+        int64_t id = json_i64(&d, v);
+        if (id >= 0 && id < GLM_VOCAB) { tokens[id] = json_unescape(&d, k); ttype[id] = TOK_NORMAL; }
+        i = json_skip(&d, v);
+    }
+    /* added_tokens: [ { "id":N, "content":"..", "special":true } ] — all special => CONTROL */
+    if (added >= 0) {
+        for (int i = added + 1; i < d.len && d.v[i].parent == added; i = json_skip(&d, i)) {
+            int idt = json_obj_get(&d, i, "id"), ct = json_obj_get(&d, i, "content");
+            if (idt < 0 || ct < 0) continue;
+            int64_t id = json_i64(&d, idt);
+            if (id < 0 || id >= GLM_VOCAB) continue;
+            free(tokens[id]); tokens[id] = json_unescape(&d, ct); ttype[id] = TOK_CONTROL;
+        }
+    }
+    /* reserved ids with no token -> placeholders */
+    int placeholders = 0;
+    for (int i = 0; i < GLM_VOCAB; i++) {
+        if (!tokens[i]) { char b[32]; snprintf(b, sizeof(b), "<|unused_%d|>", i); tokens[i] = xstrndup(b, strlen(b)); placeholders++; }
+    }
+
+    /* merges: [ ["a","b"] ] -> "a b"  (also accept plain "a b" strings) */
+    uint64_t n_merges = 0;
+    for (int i = merges + 1; i < d.len && d.v[i].parent == merges; i = json_skip(&d, i)) n_merges++;
+    char **mstr = xmalloc((size_t)(n_merges ? n_merges : 1) * sizeof(char *));
+    uint64_t mi = 0;
+    for (int i = merges + 1; i < d.len && d.v[i].parent == merges; i = json_skip(&d, i)) {
+        if (d.v[i].type == JT_STRING) { mstr[mi++] = json_unescape(&d, i); continue; }
+        if (d.v[i].type == JT_ARRAY && i + 1 < d.len && d.v[i+1].parent == i) {
+            int a = i + 1, b = json_skip(&d, a);
+            char *sa = json_unescape(&d, a);
+            char *sb = (b < d.len && d.v[b].parent == i) ? json_unescape(&d, b) : xstrndup("", 0);
+            size_t la = strlen(sa), lb = strlen(sb);
+            char *j = xmalloc(la + 1 + lb + 1);
+            memcpy(j, sa, la); j[la] = ' '; memcpy(j + la + 1, sb, lb); j[la + 1 + lb] = '\0';
+            free(sa); free(sb); mstr[mi++] = j;
+        } else mstr[mi++] = xstrndup("", 0);
+    }
+
+    kv_str    (kv, nk, "tokenizer.ggml.model", "gpt2");
+    kv_str    (kv, nk, "tokenizer.ggml.pre", "gpt2");
+    kv_arr_str(kv, nk, "tokenizer.ggml.tokens", tokens, GLM_VOCAB);
+    kv_arr_i32(kv, nk, "tokenizer.ggml.token_type", ttype, GLM_VOCAB);
+    kv_arr_str(kv, nk, "tokenizer.ggml.merges", mstr, mi);
+    kv_u32    (kv, nk, "tokenizer.ggml.eos_token_id", 154820);      /* <|endoftext|> */
+    kv_u32    (kv, nk, "tokenizer.ggml.padding_token_id", 154820);
+
+    fprintf(stderr, "glm-quantize: tokenizer: %d tokens (%d placeholders), %llu merges | "
+            "t[0]='%s' t[154820]='%s' t[154822]='%s'\n",
+            GLM_VOCAB, placeholders, (unsigned long long)mi, tokens[0], tokens[154820], tokens[154822]);
+
+    for (int i = 0; i < GLM_VOCAB; i++) free(tokens[i]);
+    free(tokens); free(ttype);
+    for (uint64_t i = 0; i < mi; i++) free(mstr[i]);
+    free(mstr);
+    json_free(&d); free(text);
+}
+
+static void write_gguf_meta(const char *out, const char *hf_dir) {
     buf kv = {0};
     int nk = 0;
     emit_metadata(&kv, &nk);
+    if (hf_dir) emit_tokenizer(&kv, &nk, hf_dir);
     FILE *f = fopen(out, "wb");
     if (!f) die("cannot open output gguf");
     uint32_t magic = GGUF_MAGIC, ver = GGUF_VERSION;
@@ -620,9 +782,9 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "glm-quantize: unknown arg: %s\n", argv[i]); usage(); }
     }
 
-    /* Modes that do not need the safetensors set. */
+    /* --verify needs only the gguf; --write-gguf needs --hf for the tokenizer. */
     if (verify_in) { verify_gguf(verify_in); return 0; }
-    if (write_out) { write_gguf_meta(write_out); return 0; }
+    if (write_out) { if (!hf_dir) usage(); write_gguf_meta(write_out, hf_dir); return 0; }
 
     if (!hf_dir) usage();
     stdb db;
