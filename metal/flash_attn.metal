@@ -1380,8 +1380,10 @@ template [[host_name("kernel_flash_attn_ext_vec_f16_dk512_dv512")]]  kernel flas
 
 // GLM-5.2 decode variant: absorbed-MLA latent key is 576 wide (512 c_kv + 64
 // decoupled rope), but the value is only the rope-free 512-wide c_kv. Same kernel
-// body as the DS4 512/512 path with a wider key (DK) than value (DV).
-template [[host_name("kernel_flash_attn_ext_vec_f16_dk576_dv512")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,  1, dequantize_f16_t4, half4,  1, dequantize_f16_t4, 576, 512, 1>;
+// body as the DS4 512/512 path with a wider key (DK) than value (DV). NE=2 (so
+// NL=NW/NE=16) because DK4=144 is divisible by 16 but not by 32 (DK 576 is not a
+// multiple of 128); DV4=128 stays divisible by 16.
+template [[host_name("kernel_flash_attn_ext_vec_f16_dk576_dv512")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,  1, dequantize_f16_t4, half4,  1, dequantize_f16_t4, 576, 512, 2>;
 
 #undef FA_TYPES
 #undef FA_TYPES_F32
