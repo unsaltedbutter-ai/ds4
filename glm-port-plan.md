@@ -169,6 +169,13 @@ with `eh_proj`, `enorm`, `hnorm`, `shared_head.norm` (+ its own attention/expert
 
 ## 3. Risk register (ranked)
 
+**Risk posture (the project-killer):** #1 is **forward-pass numerical correctness**, concentrated
+in the absorbed-MLA attention (no fallback; subtle errors are plausible-but-wrong). The fold
+algebra is now **PROVEN** (2026-06-16, `check_mla_absorption.py`, rel err ~1e-15); residual
+correctness risk is semantic-convention matching, validated end-to-end vs the official GLM API
+once the engine loads. #2 (risk to the *goal*, not the mechanics) is **Q2 quality** — has
+fallbacks (Q4/streaming, smaller ctx), and is moot until correctness holds.
+
 - **R1 — Hyper-Connections bypass (MED — RESOLVED by spike, was the gating unknown).**
   ds4's residual stream uses HC (`n_hc=4`, sinkhorn, trained per-layer tensors
   `hc_attn_*`/`hc_ffn_*`/`output_hc_*`). GLM has standard residuals and **no HC tensors**
@@ -249,8 +256,11 @@ HC state, so no payload version bump for this.
   64 rope)**, **`n_value_dim=512`**, **partial `kv_a_norm` (512 of 576)**, rope on the tail 64.
   Converter folds `kv_b_k`→`q_b` (giving `attn_q_b [2048, 64*576]`) and `kv_b_v`→output (plain
   absorbed o_proj); `attn_kv` maps directly from GLM `kv_a_proj_with_mqa`. So this is real
-  engine work (head_dim/value split + partial norm), not just a converter fold. **Resolve the
-  exact fold + dims empirically vs a CPU-slice transformers reference (weights now local).**
+  engine work (head_dim/value split + partial norm), not just a converter fold. **VALIDATED
+  2026-06-16** (`gguf-tools/check_mla_absorption.py`): native un-absorbed == absorbed to ~1e-15
+  on layers 0/3/40, and the weight-level `attn_q_b` fold reproduces the absorbed query exactly.
+  Remaining: confirm ds4's value axpy uses `n_value_dim` (512) not `n_head_dim` (576); semantic
+  conventions (rope interleave / norm scope) validated end-to-end vs the GLM API later.
 - **C. Dense first-3 layers — LOW-MED.** No dense FFN path exists today (only routed-MoE +
   shared-expert SwiGLU `layer_shared_ffn_one` `ds4.c:7184-7216`, intermediate hardcoded to
   `n_ff_exp`). Add `layer_dense_ffn_one()` reusing the SwiGLU kernel at `intermediate=12288`,
@@ -276,7 +286,8 @@ HC state, so no payload version bump for this.
 ### Phase 1 — Converter + load (needs weights)
 - [x] Tensor-name map validated via `--dry-run`; router/shared/noaux_tc-bias names confirmed
 - [x] Converter reader: bf16/f32 dequant + `--read` (validated on real tensors: norms all-positive, projections ~±0.17 mean≈0)
-- [ ] **GGUF schema contract** (metadata keys + tensor set) — joint converter+engine decision given HC-off / plain o_proj / dense-first-3 / no compressor·sinks·hash; resolve the absorbed-MLA `attn_q_b`/`attn_kv` representation against ds4's attention forward
+- [x] Absorbed-MLA representation resolved + fold **proven** (`check_mla_absorption.py`); attention config locked (`n_head_dim=576`/`n_value_dim=512`/partial `kv_a_norm`)
+- [ ] **GGUF schema contract** doc: finalize metadata keys + full tensor set (HC-off / plain o_proj / dense-first-3 / no compressor·sinks·hash)
 - [ ] Converter writer: config→metadata + GGUF authoring + MLA absorption (fold kv_b) + expert stacking + quantize; Q8-everything first
 - [ ] Model loads in ds4, `--inspect` reports GLM dims, tensors bind
 
@@ -323,3 +334,4 @@ HC state, so no payload version bump for this.
 - 2026-06-16: Recorded the **port-8085 server-down gate** (§0): converter/build/source work keeps the prod server up; only loading/running GLM on notible Metal (imatrix, first forward pass, Q2/Q4 runs) needs it down — will flag before each. Built **`gguf-tools/glm-quantize.c` skeleton**; `--dry-run` over 255 shards validated the GLM→ds4 map and **confirmed router/shared/noaux_tc-bias names** (§2b) + the ~20/78-layer IndexShare indexer. Gaps are just download-incompleteness + final `model.norm` (last shard). Converter is standalone (no GLM template GGUF exists). Next: converter body (dequant + MLA absorption + expert stacking + GGUF authoring, Q8 first).
 - 2026-06-16: Built the converter's **safetensors reader** (`stdb`: scans shard headers directly, no `index.json` needed; bf16/f32 → f32) with a `--read` mode. **Validated on real tensors** (norm gains all-positive 0.004-0.22; `q_a_proj`/expert weights symmetric ±0.17, mean≈0 → bf16 decode correct). Next design step: pin the **GGUF schema contract** (metadata + tensor set) jointly with the engine loader, and resolve the absorbed-MLA representation (how GLM's un-absorbed `kv_b` folds into ds4's `attn_q_b`/`attn_kv`/`attn_output`) by reading ds4's attention forward — that gates the converter writer and the engine attention changes.
 - 2026-06-16: **Model download complete** (1.4 TB, 282 shards, 59,585 tensors); `tokenizer.json` + `index.json` now local. `glm-quantize --dry-run` now shows the full GLM→ds4 map satisfied (only the by-design indexer SKIP is partial). MTP = layer 78 (`eh_proj`/`enorm`/`hnorm`/`shared_head.norm`). **Absorption characterized (§3c B):** GLM ⇒ engine `n_head_dim=576` (512 c_kv + 64 rope), `n_value_dim=512`, partial `kv_a_norm`; converter folds `kv_b`. This is real engine work, not just a converter fold — **next: resolve the exact fold/dims against a CPU-slice transformers reference, then write the GGUF schema contract** (gates the writer + engine attention). Mechanical converter pieces (config→metadata, tokenizer arrays, GGUF writer, expert stacking, quant) are unblocked and can proceed for non-attention tensors in parallel.
+- 2026-06-16: **De-risked the #1 risk.** `check_mla_absorption.py` on real weights (server up) shows the MLA absorption fold is exact (rel ~1e-15, layers 0/3/40) — activation-level (native==absorbed) and the weight-level `attn_q_b` fold. **Engine attention config locked:** `n_head_dim=576`, `n_value_dim=512`, partial `kv_a_norm`; converter folds `kv_b`→`q_b`/`o_proj`, `attn_kv` direct. (numpy in `.venv` via brew python3.12.) Next: GGUF schema contract → converter writer (config→metadata, tokenizer arrays, expert stacking, attention fold, Q8 authoring) → engine load changes. Port 8085 still up (no GPU/RAM step reached yet).
