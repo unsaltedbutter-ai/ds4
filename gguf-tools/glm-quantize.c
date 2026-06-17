@@ -735,7 +735,7 @@ static float *produce_o_absorb(stdb *db, int L) {
 static tplan *build_plan(int n_layers, int *count) {
     tplan *p = NULL; int n = 0, cap = 0;
     char nm[192], hf[192];
-    plan_add(&p,&n,&cap,"token_embd.weight", DS4Q_TYPE_Q8_0, 2, 6144, 154880, 0, "model.embed_tokens.weight");
+    plan_add(&p,&n,&cap,"token_embd.weight", DS4Q_TYPE_F16,  2, 6144, 154880, 0, "model.embed_tokens.weight");
     plan_add(&p,&n,&cap,"output.weight",     DS4Q_TYPE_Q8_0, 2, 6144, 154880, 0, "lm_head.weight");
     plan_add(&p,&n,&cap,"output_norm.weight",DS4Q_TYPE_F32,  1, 6144, 0, 0, "model.norm.weight");
     for (int L = 0; L < n_layers; L++) {
@@ -754,18 +754,18 @@ static tplan *build_plan(int n_layers, int *count) {
             plan_add(&p,&n,&cap,NM("ffn_up_dense.weight"),  DS4Q_TYPE_Q8_0,2,6144,12288,0, HF("mlp.up_proj.weight"));
             plan_add(&p,&n,&cap,NM("ffn_down_dense.weight"),DS4Q_TYPE_Q8_0,2,12288,6144,0, HF("mlp.down_proj.weight"));
         } else {
-            plan_add(&p,&n,&cap,NM("ffn_gate_inp.weight"),  DS4Q_TYPE_F32, 2,6144,256,0, HF("mlp.gate.weight"));
+            plan_add(&p,&n,&cap,NM("ffn_gate_inp.weight"),  DS4Q_TYPE_F16, 2,6144,256,0, HF("mlp.gate.weight"));
             plan_add(&p,&n,&cap,NM("exp_probs_b.bias"),     DS4Q_TYPE_F32, 1,256,0,0,    HF("mlp.gate.e_score_correction_bias"));
             plan_add(&p,&n,&cap,NM("ffn_gate_shexp.weight"),DS4Q_TYPE_Q8_0,2,6144,2048,0, HF("mlp.shared_experts.gate_proj.weight"));
             plan_add(&p,&n,&cap,NM("ffn_up_shexp.weight"),  DS4Q_TYPE_Q8_0,2,6144,2048,0, HF("mlp.shared_experts.up_proj.weight"));
             plan_add(&p,&n,&cap,NM("ffn_down_shexp.weight"),DS4Q_TYPE_Q8_0,2,2048,6144,0, HF("mlp.shared_experts.down_proj.weight"));
             char tmpl[256];
             snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.gate_proj.weight",L);
-            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_gate_exps.weight"),DS4Q_TYPE_Q8_0,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_gate_exps.weight"),DS4Q_TYPE_Q4_K,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
             snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.up_proj.weight",L);
-            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_up_exps.weight"),  DS4Q_TYPE_Q8_0,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_up_exps.weight"),  DS4Q_TYPE_Q4_K,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
             snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.down_proj.weight",L);
-            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_down_exps.weight"),DS4Q_TYPE_Q8_0,3,2048,6144,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_down_exps.weight"),DS4Q_TYPE_Q4_K,3,2048,6144,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
         }
         #undef NM
         #undef HF

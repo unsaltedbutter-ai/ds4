@@ -3096,6 +3096,12 @@ typedef struct {
     ds4_tensor *ffn_gate_shexp;
     ds4_tensor *ffn_up_shexp;
     ds4_tensor *ffn_down_shexp;
+    /* GLM variant: plain output projection (no grouped LoRA) + dense-layer FFN
+     * for the first n_first_k_dense layers (no routed MoE there). */
+    ds4_tensor *attn_output;
+    ds4_tensor *ffn_gate_dense;
+    ds4_tensor *ffn_up_dense;
+    ds4_tensor *ffn_down_dense;
 } ds4_layer_weights;
 
 typedef struct {
@@ -3500,6 +3506,8 @@ static void tensor_expect_routed_expert(
 }
 
 static bool weights_have_output_head(const ds4_weights *w) {
+    if (w && DS4_MODEL_VARIANT == DS4_VARIANT_GLM)
+        return w->output_norm && w->output;  /* GLM has no HC output collapse */
     return w &&
            w->output_hc_base &&
            w->output_hc_fn &&
@@ -3509,6 +3517,8 @@ static bool weights_have_output_head(const ds4_weights *w) {
 }
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
+    if (w && DS4_MODEL_VARIANT == DS4_VARIANT_GLM)
+        return w->output_norm || w->output;
     return w &&
            (w->output_hc_base ||
             w->output_hc_fn ||
@@ -3519,6 +3529,15 @@ static bool weights_have_partial_output_head(const ds4_weights *w) {
 
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        if (!l->attn_norm || !l->attn_q_a || !l->attn_q_a_norm || !l->attn_q_b ||
+            !l->attn_kv || !l->attn_kv_a_norm || !l->attn_output || !l->ffn_norm)
+            return false;
+        if (il < DS4_N_FIRST_K_DENSE)
+            return l->ffn_gate_dense && l->ffn_up_dense && l->ffn_down_dense;
+        return l->ffn_gate_inp && l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+               l->ffn_gate_shexp && l->ffn_up_shexp && l->ffn_down_shexp;
+    }
     if (!l->hc_attn_fn ||
         !l->hc_attn_scale ||
         !l->hc_attn_base ||
@@ -3587,6 +3606,36 @@ static const ds4_layer_weights *weights_first_bound_layer(const ds4_weights *w) 
     return NULL;
 }
 
+/* GLM tensor layout validation: absorbed MLA (key=576, value=512), plain output
+ * projection, dense FFN for the first n_first_k_dense layers, no HC/compressor. */
+static void glm_validate_layer(const ds4_layer_weights *l, uint32_t il) {
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;    /* 64*576 */
+    const uint64_t v_dim = (uint64_t)DS4_N_HEAD * DS4_N_VALUE_DIM;   /* 64*512 */
+    const uint64_t kv_latent = (uint64_t)DS4_N_HEAD_DIM - DS4_N_ROT; /* 512 c_kv */
+    tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+    tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
+    tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
+    tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+    tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, kv_latent, 0, 0);
+    tensor_expect_layout(l->attn_output,    DS4_TENSOR_Q8_0, 2, v_dim, DS4_N_EMBD, 0);
+    tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    if (il < DS4_N_FIRST_K_DENSE) {
+        tensor_expect_layout(l->ffn_gate_dense, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, 12288, 0);
+        tensor_expect_layout(l->ffn_up_dense,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, 12288, 0);
+        tensor_expect_layout(l->ffn_down_dense, DS4_TENSOR_Q8_0, 2, 12288, DS4_N_EMBD, 0);
+    } else {
+        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+    }
+}
+
 /* Verify every tensor type and dimension used by the specialized pipeline.
  * For distributed sliced GGUFs, only the advertised local layer range is
  * required; token embedding and output head are validated when present. */
@@ -3616,7 +3665,10 @@ static void weights_validate_layout(
     const bool have_output = weights_have_output_head(w);
     if (require_output && !have_output) ds4_die("required output head tensors are missing");
     if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
-    if (have_output) {
+    if (have_output && DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(w->output,      DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    } else if (have_output) {
         tensor_expect_layout(w->output_hc_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
         tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
         tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
@@ -3631,6 +3683,8 @@ static void weights_validate_layout(
             fprintf(stderr, "ds4: required tensors for layer %u are missing\n", il);
             exit(1);
         }
+
+        if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) { glm_validate_layer(l, il); continue; }
 
         tensor_expect_layout(l->hc_attn_fn,     DS4_TENSOR_F16,  2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
@@ -4056,6 +4110,18 @@ static void config_validate_model(const ds4_model *m) {
 }
 
 static void weights_bind_output(ds4_weights *w, const ds4_model *m, bool required, bool optional) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        if (required) {
+            w->output_norm = required_tensor(m, "output_norm.weight");
+            w->output      = required_tensor(m, "output.weight");
+        } else if (optional) {
+            w->output_norm = model_find_tensor(m, "output_norm.weight");
+            w->output      = model_find_tensor(m, "output.weight");
+            if (weights_have_partial_output_head(w) && !weights_have_output_head(w))
+                ds4_die("partial output head in GGUF");
+        }
+        return;
+    }
     if (required) {
         w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
         w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
@@ -4077,6 +4143,31 @@ static void weights_bind_output(ds4_weights *w, const ds4_model *m, bool require
 }
 
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        l->attn_norm      = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+        l->attn_q_a       = required_tensorf(m, "blk.%u.attn_q_a.weight", il);
+        l->attn_q_a_norm  = required_tensorf(m, "blk.%u.attn_q_a_norm.weight", il);
+        l->attn_q_b       = required_tensorf(m, "blk.%u.attn_q_b.weight", il);
+        l->attn_kv        = required_tensorf(m, "blk.%u.attn_kv.weight", il);
+        l->attn_kv_a_norm = required_tensorf(m, "blk.%u.attn_kv_a_norm.weight", il);
+        l->attn_output    = required_tensorf(m, "blk.%u.attn_output.weight", il);
+        l->ffn_norm       = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+        if (il < DS4_N_FIRST_K_DENSE) {
+            l->ffn_gate_dense = required_tensorf(m, "blk.%u.ffn_gate_dense.weight", il);
+            l->ffn_up_dense   = required_tensorf(m, "blk.%u.ffn_up_dense.weight", il);
+            l->ffn_down_dense = required_tensorf(m, "blk.%u.ffn_down_dense.weight", il);
+        } else {
+            l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+            l->ffn_exp_probs_b = tensor_by_namef(m, "blk.%u.exp_probs_b.bias", il);
+            l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+            l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+            l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+            l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+            l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+            l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+        }
+        return;
+    }
     const uint32_t compress_ratio = ds4_layer_compress_ratio(il);
 
     l->hc_attn_fn      = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il);
