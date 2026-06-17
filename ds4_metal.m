@@ -320,7 +320,9 @@ static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
 static int g_mpp_invalid_env_reported;
-static int32_t g_routed_moe_selected_override[6];
+/* Max experts/token across variants: DeepSeek uses 6, GLM-5.2 uses 8. */
+#define DS4_GPU_MAX_EXPERT_USED 8
+static int32_t g_routed_moe_selected_override[DS4_GPU_MAX_EXPERT_USED];
 static uint32_t g_routed_moe_selected_override_n;
 static int g_moe_selected_trace_record_initialized;
 static FILE *g_moe_selected_trace_record_fp;
@@ -22635,7 +22637,7 @@ int ds4_gpu_router_select_batch_tensor(
 }
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected) {
-    if (n_selected > 6 || (!selected && n_selected != 0)) return 0;
+    if (n_selected > DS4_GPU_MAX_EXPERT_USED || (!selected && n_selected != 0)) return 0;
     for (uint32_t i = 0; i < n_selected; i++) {
         g_routed_moe_selected_override[i] = selected[i];
     }
