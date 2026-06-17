@@ -407,11 +407,11 @@ test harnesses) on a few tokens — they should match within quant/precision noi
 
 ## 7b. Known gaps / cautions for whoever continues
 
-- **RoPE for positions >0 is UNVALIDATED.** All current validation is single-token at position 0, where the
-  rope rotation angle is 0 → rope = identity. So the head-test / first-token-test do NOT exercise rope.
-  GLM config has `rope_interleave: true` (interleaved pairs); ds4's `rope_tail`/`kernel_dsv4_rope_tail_f32`
-  may apply split-half (NeoX) rotation. **Verify the rope pairing convention before trusting multi-token
-  generation** — a mismatch is invisible at pos 0 but corrupts attention at pos>0. (rope θ=8e6 is set.)
+- **RoPE convention: VERIFIED OK for GLM.** ds4's `rope_tail` (ds4.c ~7010, `kernel_dsv4_rope_tail_f32`)
+  rotates *adjacent pairs* `tail[i],tail[i+1]` — the **interleaved** convention, which matches GLM's
+  `rope_interleave: true` (on the 64 rope dims at the head tail [512:576], θ=8e6 set, YaRN off since
+  `rope_scale_factor=1` → `freq_scale=mscale=1`). So rope is correct at all positions, not just pos 0.
+  (Still worth a multi-token sanity check once generation runs, but no convention mismatch.)
 - **CPU generation (prefill+decode) is NOT done.** `generate_raw_swa_cpu` → `prefill_layer_major_cpu` + a
   decode loop use BATCH attention variants (ds4.c ~9086/9149/9215 `layer_attention_prefix_batch`, ~9549
   `layer_attention_raw_swa_batch`) and decode-scratch fns (`layer_kv_projection_normed_one_decode_scratch`
