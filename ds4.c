@@ -15185,9 +15185,12 @@ static bool metal_graph_encode_decode_layer_glm(
         /* Dense SwiGLU MLP (intermediate 12288).  Reuse the wider routed-MoE
          * scratch (unused on dense layers) for gate/up/mid. */
         const uint64_t dense_dim = layer->ffn_gate_dense->dim[1];
-        if (ok) ok = ds4_gpu_matmul_q8_0_pair_tensor(g->routed_gate, g->routed_up, model->map, model->size,
-                                                     layer->ffn_gate_dense->abs_offset, layer->ffn_up_dense->abs_offset,
-                                                     DS4_N_EMBD, dense_dim, dense_dim, g->ffn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->routed_gate, model->map, model->size,
+                                                layer->ffn_gate_dense->abs_offset,
+                                                DS4_N_EMBD, dense_dim, g->ffn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->routed_up, model->map, model->size,
+                                                layer->ffn_up_dense->abs_offset,
+                                                DS4_N_EMBD, dense_dim, g->ffn_norm, 1) != 0;
         if (ok) ok = ds4_gpu_swiglu_tensor(g->routed_mid, g->routed_gate, g->routed_up,
                                            (uint32_t)dense_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->ffn_out, model->map, model->size, layer->ffn_down_dense->abs_offset,
