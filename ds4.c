@@ -108,7 +108,7 @@ static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
  */
 
 enum {
-    DS4_MAX_LAYER            = 61,
+    DS4_MAX_LAYER            = 78,  /* GLM-5.2 has 78 layers (DeepSeek Pro has 61) */
     DS4_MAX_EMBD             = 7168,
     DS4_MAX_VOCAB            = 129280,
     DS4_MAX_HEAD             = 128,
