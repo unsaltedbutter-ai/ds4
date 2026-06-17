@@ -367,6 +367,44 @@ partial), `attn_output` (plain absorbed `[64*512,6144]`); MoE≥3: `ffn_gate_inp
 dense FFN <3; attention key=576/value=512 + partial `kv_a_norm`; full-attention KV (compression off);
 GLM tokenizer/template/`<tool_call>`; multi-EOS. `general.architecture` reuses `deepseek4` (unvalidated).
 
+## 7. Metal-graph port — remaining work to run GLM at SPEED
+
+The CPU reference forward is GLM-complete and validated (all 78 layers, finite logits). To run
+GLM on notible at usable speed, the **Metal graph** (`ds4_metal.m` + `metal/*.metal`) needs the
+SAME variant-gated deltas, mirroring the CPU ones. Each below = a known site + the change.
+Quant kernels (IQ2_XXS/Q2_K/Q4_K MoE, Q8 matmul) already exist; this is graph wiring + a few
+kernel params. Gate everything on `DS4_MODEL_VARIANT == DS4_VARIANT_GLM`.
+
+1. **HC bypass.** Metal HC pipelines: `g_hc_split_sinkhorn_pipeline`, `g_hc_split_weighted_sum[_norm]`,
+   `ds4_gpu_hc_*` encoders, `kernel_dsv4_hc_*` (`metal/dsv4_hc.metal`), and the fused decode HC
+   (`ds4_metal.m` ~25862, already `if (n_hc!=4) return 0` → unfused fallback). For GLM (`n_hc=1`):
+   the per-layer graph must replace `hc_pre`(split+weighted_sum) with **just the RMSNorm** of the
+   single `[n_embd]` residual, and `hc_post` with a **plain residual add** (block_out + residual).
+   Skip binding/encoding all `hc_*`/`output_hc_*` tensors. Hidden buffer is `[n_embd]` not `[4*n_embd]`.
+2. **Attention 576/512.** Flash-attn kernels are templated `dk512_dv512` (`metal/flash_attn.metal`).
+   GLM needs **key/score dim 576, value dim 512** — add a `dk576_dv512` template (or a GLM MLA path),
+   softmax scale **1/√256** (not 1/√head_dim), and **no attn_sinks** (GLM lacks them). The decoupled
+   rope tail (`kernel_dsv4_rope_tail_f32`) applies to dims [512:576]; **skip the inverse-rope on the
+   value** for GLM (value = rope-free c_kv). `kv_a_norm` normalizes only the first 512 of the 576 latent.
+3. **Plain o_proj.** Grouped output LoRA (`ds4_gpu_attention_output_q8_batch`, `ds4_attention_output_group_ids`)
+   → GLM plain matmul `attn_output [64*512=32768 → 6144]` (reuse the Q8 matmul, no grouping).
+4. **Dense FFN (layers <3).** `metal_graph_encode_layer_ffn_batch` → GLM dense layers run a SwiGLU on
+   `ffn_{gate,up,down}_dense` (intermediate 12288); skip routed MoE + shared + router for those layers.
+5. **Router scoring.** `g_dsv4_softplus_sqrt_pipeline` computes `sqrt(softplus(x))`; GLM is **sigmoid**
+   (`scoring_func`). Add a sigmoid variant kernel/param; keep the noaux_tc bias (`exp_probs_b`) + flat
+   top-8 (`g_dsv4_router_*`) + normalized weights × 2.5 (already general once `n_expert_used=8`).
+6. **Output head.** Skip the Metal HC collapse (`output_hc_fn`); GLM does final RMSNorm(`output_norm`) +
+   `output` matmul only.
+7. **Raw-KV path / no compression.** GLM runs `compress_ratio=0` (raw latent KV). Verify the Metal raw-KV
+   store/read (`metal/dsv4_kv.metal`) works at `head_dim=576`/`value=512` (it stores the 576 latent; value
+   reads first 512). The FP8/compressor and the DSA indexer paths are skipped for GLM v1.
+8. **SSD streaming** (for Q2 + big context on 256 GB): the routed-expert streaming cache is MoE-structural
+   and should apply directly once the Metal forward runs (same 256-expert stacked layout); tune per §3b.
+
+Shared fixes already in place (help both backends): `DS4_SHAPE_GLM`, `DS4_MAX_EXPERT_USED=8`, load path.
+Validation: once the Metal forward runs, compare its logits to the CPU forward (ds4 has metal-graph-vs-cpu
+test harnesses) on a few tokens — they should match within quant/precision noise.
+
 ## 6. Status log
 - 2026-06-16: Investigation complete. Confirmed GLM-5.2 = `glm_moe_dsa` (MLA+DSA+MoE, DeepSeek-V4 cousin). Verified config, geometry map, GLM chat template. Identified **Hyper-Connections removal (R1)** as the gating risk (missing from porting.md). Branch `ds4-glm` ready locally; notible checkout exists on `main`; model ~18% downloaded.
 - 2026-06-16: Per user, added **Q2 and Q4 both as Phase 4 build targets** (Q4 = SSD-streaming-only on 256 GB) for a real quality/speed comparison, and the **§3b M1 memory-fit study** (quantized KV is the key lever for Q2 + large context on 256 GB). Pushed groundwork to `origin`; checked out `ds4-glm` on notible (sync loop proven).
