@@ -425,6 +425,90 @@ test harnesses) on a few tokens — they should match within quant/precision noi
 - The first-token-test top token for a bare OOD single token is `[gMASK]` (GLM's sequence-start token) —
   expected, not a bug; a real continuation needs `[gMASK]<sop>` framing + prefill.
 
+## 7c. Metal decode-path implementation spec (code-grounded, 2026-06-17)
+
+Reverse-engineered against the current source (line numbers verified this session). This turns §7
+into a mechanical, site-by-site spec for the **single-token decode** Metal graph (the milestone:
+"HC bypass + 576/512 attention, validated vs CPU"). Prefill/batch + multi-token KV retention are a
+later milestone.
+
+**Design decision — isolated GLM functions, DeepSeek/CUDA hot paths bit-identical.** The decode-heads
+and router-select GPU entry points have CUDA implementations (`ds4_cuda.cu`), so changing their
+signatures would break the (here-untestable) CUDA build. So: add *new* GLM Metal functions, leave
+existing ones untouched, and give each new public GLM GPU fn a CUDA **stub** (`return 0`) so the CUDA
+build keeps linking. CUDA+GLM is unsupported for now — flag to user per AGENT.md (no CUDA box to test).
+
+**Validation harness = `--metal-graph-full-test`, NOT `--metal-graph-test`.** `metal_graph_decode_test`
+(ds4.c:16770, the single-layer-0 per-stage diff) is hardwired to MoE expert tensors and an
+*unconditional* inverse-rope on heads (16848) → wrong for GLM (layer 0 is dense; GLM skips inverse-rope;
+GLM layer-0 has no expert tensors). Use `metal_graph_first_token_full_test` (ds4.c:17013): it compares
+each layer's GPU hidden state to `layer_forward_self_one` (the validated GLM CPU forward). Env knobs:
+`DS4_METAL_GRAPH_TRACE_LAYERS=1` (per-layer max/rms diff), `DS4_METAL_GRAPH_TEACHER_FORCE=1` (reset GPU
+to CPU state each layer → isolates per-layer error, no accumulation), `DS4_METAL_GRAPH_TRACE_STAGE_LAYER=N`
+(+`metal_graph_trace_layer_stages`, stage diffs for layer N). NB: single token at pos 0 ⇒ 1 KV row, so
+attention softmax is degenerate (weight 1.0) — it still validates dispatch/scale/value-extract/no-sinks,
+but multi-row softmax is inherited from the proven 512/512 kernel body.
+
+**Sites:**
+
+1. **Flash-attn kernel — DONE this session.** `kernel_flash_attn_ext_vec_f16_dk576_dv512` added to
+   `metal/flash_attn.metal` (vec template `<...,576,512,1>`, signature-only `flash_attn_ext_vec_t`,
+   static_asserts pass: 576%32=18, 512%32=16). Prefill non-vec `dk576_dv512` deferred (decode milestone
+   uses only the vec kernel). RISK: register/threadgroup budget for DK=576 only surfaces at
+   `newComputePipelineState` time (the gated run), not at metal-source compile.
+
+2. **GLM raw-heads encoder** — clone `ds4_gpu_encode_flash_attention_raw_heads` (ds4_metal.m:16793) as
+   `_glm`, isolated (drop the `head_dim!=512` reject at 16805). Dim split (the whole point):
+   - **KEY dims = 576** (q is 576-wide incl rope tail; K/V share one f16 buffer with 576-wide rows):
+     `q_bytes=n_head*576*4`, `raw_bytes=raw_cap*576*4`, ring buffer, f16-kv copy `n_raw*576`,
+     `row_bytes_f16=576*2`, `ns10=ns20=576`, `nb11=nb21=576*2` and the `*12/*13` strides, pad sizing,
+     `shared_bytes` (align by 576 — safe over-alloc).
+   - **VALUE dims = 512** (output heads are the rope-free c_kv): `heads_bytes=n_head*512*4`, output
+     strides `nb01=n_head*512*4`/`nb02=512*4`/`nb03=...`, tmp partial width 512,
+     `reduce_pipeline = ds4_gpu_get_flash_attn_reduce_pipeline(512, nwg)`.
+   - `vec_args.scale = 1/sqrtf(256.0f)`; `has_sinks=false` (vec-pipeline-getter 2nd arg; no sinks buffer
+     wrapped); pipeline name `kernel_flash_attn_ext_vec_f16_dk576_dv512`.
+
+3. **Public `ds4_gpu_attention_decode_heads_glm_tensor`** (Metal + `ds4_gpu.h` extern + CUDA stub) — like
+   ds4_metal.m:19434 but no `sinks_offset` (GLM `attn_sinks` is NULL), `n_comp==0` path only (no
+   compressor/indexer for v1), key_dim=576/value_dim=512.
+
+4. **Sigmoid router** — thread `bool sigmoid_scoring` into the static `ds4_gpu_encode_router_select`
+   (ds4_metal.m ~21869; at the softplus_sqrt site ~21996 branch to `g_unary_sigmoid_pipeline`, which
+   already exists). Add a public `ds4_gpu_router_select_glm_tensor` wrapper (+ CUDA stub). Keep noaux_tc
+   bias + flat top-8 + normalized×2.5 (already general once `n_expert_used=8`).
+
+5. **`metal_graph_encode_decode_layer_glm(...)`** — dispatch at the TOP of
+   `metal_graph_encode_decode_layer` (ds4.c:15074): `if (DS4_MODEL_VARIANT==DS4_VARIANT_GLM) return
+   metal_graph_encode_decode_layer_glm(...)`. `cur_hc` is the single `[n_embd]` residual (DS4_N_HC=1).
+   Sequence (mirrors the proven CPU `layer_forward_self_one`):
+   - a. `attn_norm = rms_norm_weight(cur_hc, attn_norm)` — HC-pre bypass; residual stays `cur_hc`.
+   - b. Q: `qr=matmul_q8(attn_q_a,attn_norm)`; `qr_norm=rms_norm_weight(qr,attn_q_a_norm,q_rank)`;
+        `q=matmul_q8(attn_q_b,qr_norm)`; `head_rms_norm(q,64,576)`; `rope_tail(q,inverse=false)`.
+   - c. KV: `kv=matmul_q8(attn_kv,attn_norm)` [576]; `rms_norm_weight(kv,kv,kv_a_norm,512)` IN-PLACE over
+        first 512 (tail 512:576 stays raw rope — verify in-place safe, else norm kv_raw→kv[0:512] +
+        `ds4_gpu_encode_cpy_f32_f32_1d` for [512:576]); `rope_tail(kv,1 head,576,inverse=false)`;
+        `metal_graph_decode_kv_store(kv,raw_cache,raw_cap,raw_row)`.
+   - d. `heads = ds4_gpu_attention_decode_heads_glm_tensor(q,raw_cache,n_raw,...)`; **SKIP** the
+        inverse-rope-on-heads (ds4.c:15659 in the DS4 path) — GLM value is rope-free.
+   - e. `attn_out = matmul_q8(attn_output, heads)` [plain o_proj, 64*512=32768 → 6144].
+   - f. `after_attn_hc = add(attn_out, cur_hc)` — HC-post bypass = plain residual add.
+   - g. `ffn_norm = rms_norm_weight(after_attn_hc, ffn_norm)` — HC-pre bypass.
+   - h. FFN: if `il < DS4_N_FIRST_K_DENSE`: dense `matmul_pair(ffn_gate_dense,ffn_up_dense)`→
+        `swiglu`→`matmul(ffn_down_dense)`; `ffn_out=dense`. else: `router_select_glm`(sigmoid) →
+        `ds4_gpu_routed_moe_one_tensor`(ffn_*_exps, simple non-overlap path 16180) + shared expert
+        (`ffn_*_shexp` gate/up/swiglu/down); `ffn_out = add(shared, routed)`.
+   - i. `after_ffn_hc = add(ffn_out, after_attn_hc)`; write to `g->after_ffn_hc` (caller swaps).
+   Skip ALL fused-HC and expert-streaming-overlap branches (they need DS4_N_HC==4 and HC tensors).
+
+6. **Output head** — `metal_graph_encode_output_head` (ds4.c:16303) GLM branch: skip the `output_hc`
+   collapse (GLM lacks `output_hc_*`); `output_embd = cur_hc` (already `[n_embd]`);
+   `output_norm = rms_norm_weight(output_embd, output_norm)`; `logits = matmul_q8(output, output_norm)`.
+
+**Out of decode-milestone scope (later):** prefill/batch Metal (`metal_graph_encode_layer_batch`
+ds4.c:19493), multi-token KV full-attention retention (`n_swa=0`), expert streaming/overlap, MTP,
+CUDA+GLM.
+
 ## 6b. FINAL SUMMARY (end of 2026-06-16/17 ~8h unattended run)
 
 **Outcome: GLM-5.2 loads and runs (forward pass) on ds4, validated end-to-end on the real 753 B model
@@ -465,6 +549,23 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (Metal port begun): **Reverse-engineered the decode-path Metal graph and wrote the
+  code-grounded implementation spec (§7c).** Confirmed the per-layer Metal flow lives in
+  `metal_graph_encode_decode_layer` (ds4.c:15074, ~1230 lines of HC-fusion + expert-streaming
+  optimizations), called from C; the kernels live in `ds4_metal.m`/`metal/*.metal`. Key findings: (1)
+  validation must use `--metal-graph-full-test` (`metal_graph_first_token_full_test`, vs the GLM-aware
+  CPU `layer_forward_self_one`), NOT `--metal-graph-test` (hardwired to MoE experts + unconditional
+  inverse-rope → not GLM-correct). (2) The flash-attn raw-heads encoder (ds4_metal.m:16793) rejects
+  `head_dim!=512` and is parameterized by a single `head_dim` assuming DK==DV; GLM needs DK=576/DV=512
+  threaded separately (full dim-split mapped in §7c), scale 1/√256, no sinks. (3) decode-heads +
+  router-select have CUDA impls → keep their signatures untouched, add isolated GLM fns + CUDA stubs.
+  **Landed:** `kernel_flash_attn_ext_vec_f16_dk576_dv512` in metal/flash_attn.metal (the riskiest novel
+  piece; DK=576 register budget verifiable only at the gated pipeline-creation run). Architecture
+  decided: a dedicated `metal_graph_encode_decode_layer_glm()` + output-head GLM branch (keeps the
+  DeepSeek/CUDA hot path bit-identical per AGENT.md). **Remaining (all compile-checkable with the prod
+  server UP; numerical validation needs the prod server DOWN — a gated step requiring the user):** the
+  GLM raw-heads encoder, public GLM decode-heads + sigmoid-router wrappers (+ CUDA stubs),
+  `metal_graph_encode_decode_layer_glm`, and the output-head branch — each spec'd site-by-site in §7c.
 - 2026-06-17 ~01:25: **Q2 validated through the FULL forward + Q2-vs-Q4 comparison.** Q2 first-token-test
   (all 78 layers incl IQ2_XXS gate/up + Q2_K down MoE) **completed cleanly**: finite logits min=-8.98
   max=27.19 rms=2.12, top `[gMASK]` (27.19) — consistent with Q4's full-forward behavior (top `[gMASK]`
