@@ -157,9 +157,12 @@ Per-layer names/shapes (all BF16) the converter maps to ds4's GGUF tensors:
 | `mlp.experts.{0..255}.down_proj` (L≥3) | [6144,2048] | stack |
 
 **Converter's biggest job:** experts ship as 256 separate tensors per projection per MoE
-layer; ds4 expects them stacked `[blocks, features, expert_id]`. Still TODO from a later
-shard / the index: router (`mlp.gate`), shared-expert (`mlp.shared_experts.*`), final
-`model.norm`, and MTP (`nextn`) tensor names — pending `model.safetensors.index.json`.
+layer; ds4 expects them stacked `[blocks, features, expert_id]`. **Confirmed by
+`glm-quantize --dry-run` (2026-06-16):** router `mlp.gate.weight` → `ffn_gate_inp`; noaux_tc
+bias `mlp.gate.e_score_correction_bias` → `exp_probs_b.bias`; shared expert
+`mlp.shared_experts.{gate,up,down}_proj` → `ffn_*_shexp`. DSA indexer weights live on only
+~20/78 layers (the `full` indexer layers; `shared` layers reuse them — matches IndexShare).
+Still pending the last shard: final `model.norm.weight` and MTP (`nextn`) tensor names.
 
 ---
 
@@ -259,12 +262,13 @@ HC state, so no payload version bump for this.
 - [x] Attention/FFN graph-delta map: o_proj (LOW), q/kv up-proj (MED), dense first-3 (LOW-MED) (see §3c)
 - [ ] Draft GLM prompt-rendering + `<tool_call>` parser design (have the template)
 - [x] Tensor-name schema captured from shard headers (§2b) — router/shared/MTP names + `index.json` still pending
-- [ ] Draft converter skeleton: bf16 safetensors reader + expert-stacking packer
+- [x] Converter skeleton `gguf-tools/glm-quantize.c`: safetensors scanner + GLM→ds4 map + `--dry-run` coverage (validated on partial download; router/shared/bias names confirmed)
 - [ ] Add `CLAUDE.md` for the fork (GLM context, points here)
 - [ ] Capture golden-logit plan (HF `transformers` reference; can't run until weights complete)
 
 ### Phase 1 — Converter + load (needs weights)
-- [ ] safetensors(bf16) → GGUF converter, Q8_0-everything first (correctness ref, ignore size)
+- [x] Tensor-name map validated via `--dry-run`; router/shared/noaux_tc-bias names confirmed
+- [ ] Converter body: bf16 dequant + **MLA absorption (fold kv_b into q_b/o_proj)** + expert stacking + GGUF authoring; Q8-everything first (correctness ref, ignore size)
 - [ ] Model loads in ds4, `--inspect` reports GLM dims, tensors bind
 
 ### Phase 2 — CPU numerical bring-up ⚠️ (riskiest, cheapest place to prove it)
@@ -307,3 +311,4 @@ HC state, so no payload version bump for this.
 - 2026-06-16: Investigation complete. Confirmed GLM-5.2 = `glm_moe_dsa` (MLA+DSA+MoE, DeepSeek-V4 cousin). Verified config, geometry map, GLM chat template. Identified **Hyper-Connections removal (R1)** as the gating risk (missing from porting.md). Branch `ds4-glm` ready locally; notible checkout exists on `main`; model ~18% downloaded.
 - 2026-06-16: Per user, added **Q2 and Q4 both as Phase 4 build targets** (Q4 = SSD-streaming-only on 256 GB) for a real quality/speed comparison, and the **§3b M1 memory-fit study** (quantized KV is the key lever for Q2 + large context on 256 GB). Pushed groundwork to `origin`; checked out `ds4-glm` on notible (sync loop proven).
 - 2026-06-16: Ran two spikes. **R1 (HC) resolved → bypass path, ~6-8 sites, not a rewrite (§3c).** Attention/FFN deltas mapped: o_proj LOW, dense-first-3 LOW-MED, q/kv up-proj MED (§3c). Captured **verified GLM tensor schema from shard headers (§2b)** — key converter job is stacking 256 per-expert tensors. Download now ~73% (207/282 shards). Next: converter skeleton + `DS4_SHAPE_GLM`/HC-bypass scaffolding once `index.json` lands (router/shared/MTP names).
+- 2026-06-16: Recorded the **port-8085 server-down gate** (§0): converter/build/source work keeps the prod server up; only loading/running GLM on notible Metal (imatrix, first forward pass, Q2/Q4 runs) needs it down — will flag before each. Built **`gguf-tools/glm-quantize.c` skeleton**; `--dry-run` over 255 shards validated the GLM→ds4 map and **confirmed router/shared/noaux_tc-bias names** (§2b) + the ~20/78-layer IndexShare indexer. Gaps are just download-incompleteness + final `model.norm` (last shard). Converter is standalone (no GLM template GGUF exists). Next: converter body (dequant + MLA absorption + expert stacking + GGUF authoring, Q8 first).
