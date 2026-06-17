@@ -15211,6 +15211,7 @@ static bool metal_graph_encode_decode_layer_glm(
         const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
         /* Sigmoid noaux_tc routing on the CPU (writes router_selected/weights). */
         if (ok) ok = metal_graph_glm_cpu_router(g, model, layer);
+        GLM_STEP("moe_router");
         /* Shared expert (always on for MoE layers). */
         if (ok) ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate, g->shared_up, g->shared_mid,
                                                                model->map, model->size,
@@ -15221,6 +15222,7 @@ static bool metal_graph_encode_decode_layer_glm(
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
                                                 layer->ffn_down_shexp->abs_offset,
                                                 shared_dim, DS4_N_EMBD, g->shared_mid, 1) != 0;
+        GLM_STEP("moe_shared");
         /* Routed experts (top-8). */
         if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out, g->routed_gate, g->routed_up, g->routed_mid, g->routed_down,
                                                    model->map, model->size,
@@ -15231,6 +15233,7 @@ static bool metal_graph_encode_decode_layer_glm(
                                                    (uint32_t)expert_in_dim, (uint32_t)down_in_dim, (uint32_t)routed_out_dim,
                                                    g->router_selected, g->router_weights, DS4_N_EXPERT,
                                                    DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm, il) != 0;
+        GLM_STEP("moe_routed");
         if (ok) ok = ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
     }
     GLM_STEP("ffn");
