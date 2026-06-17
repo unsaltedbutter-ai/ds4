@@ -327,6 +327,46 @@ HC state, so no payload version bump for this.
 
 ---
 
+## 5c. GGUF schema contract (GLM) — DRAFT
+
+`config_validate_model` (ds4.c:3888-3997) requires these `deepseek4.*` keys and checks each
+**== the selected shape's constant**. So the contract = add `DS4_SHAPE_GLM` with these values,
+emit matching metadata, and gate behavior on `variant==GLM`.
+
+| metadata key | GLM value | note |
+|---|---|---|
+| block_count / embedding_length / vocab_size | 78 / 6144 / 154880 | |
+| attention.head_count / head_count_kv | 64 / 1 | absorbed MQA-in-latent |
+| attention.key_length / value_length | **576 / 512** | key=512 c_kv+64 rope; value=c_kv only |
+| rope.dimension_count / q_lora_rank | 64 / 2048 | |
+| attention.output_lora_rank / output_group_count | 0 / 1 | sentinels: plain o_proj |
+| expert_count / used / ff_length / shared | 256 / 8 / 2048 / 1 | |
+| hash_layer_count | 0 | GLM dense, not hash |
+| expert_group_count / used | 0 / 0 | n_group=1 |
+| attention.sliding_window | TBD | GLM full attn — verify ratio-0 raw-KV sizing |
+| attention.indexer.{head_count,key_length,top_k} | 32 / 128 / 2048 | nominal; v1 skips indexer |
+| hyper_connection.count / sinkhorn_iterations | 1 / 0 | HC bypassed |
+| rope.freq_base / scaling.factor | 8e6 / 1.0 | no YaRN |
+| attention.compress_rope_freq_base | nominal | compression off |
+| expert_weights_scale | 2.5 | routed_scaling_factor |
+| attention.layer_norm_rms_epsilon | 1e-5 | (ds4 was 1e-6) |
+| hyper_connection.epsilon | nominal | HC off |
+| expert_weights_norm | true | norm_topk_prob |
+| compress_ratios[78] | all 0 | need `ds4_expected_layer_compress_ratio`→0 for GLM |
+| swiglu_clamp_exp[78] | disable | GLM plain SwiGLU, no clamp |
+| + NEW first_k_dense_count | 3 | new key for dense-first-3 |
+
+**Tensors emitted** (`blk.N.`): `attn_norm`, `ffn_norm`, `attn_q_a`, `attn_q_a_norm`, `attn_q_b`
+(absorbed `[2048,64*576]`), `attn_kv` (=`kv_a_proj_with_mqa` `[6144,576]`), `attn_kv_a_norm` (`[512]`,
+partial), `attn_output` (plain absorbed `[64*512,6144]`); MoE≥3: `ffn_gate_inp`, `exp_probs_b.bias`,
+`ffn_*_shexp`, `ffn_{gate,up,down}_exps` (stacked 256); dense<3: `ffn_{gate,up,down}_dense`; top:
+`token_embd`, `output_norm`, `output`. **NOT emitted** (engine skips for GLM): `hc_*`/`output_hc_*`,
+`attn_compressor_*`, `indexer*`, `attn_sinks`, `ffn_gate_tid2eid`, `attn_output_a/b`.
+
+**Engine deltas gated on `variant==GLM`** (the bulk of the work): HC bypass; plain `attn_output`;
+dense FFN <3; attention key=576/value=512 + partial `kv_a_norm`; full-attention KV (compression off);
+GLM tokenizer/template/`<tool_call>`; multi-EOS. `general.architecture` reuses `deepseek4` (unvalidated).
+
 ## 6. Status log
 - 2026-06-16: Investigation complete. Confirmed GLM-5.2 = `glm_moe_dsa` (MLA+DSA+MoE, DeepSeek-V4 cousin). Verified config, geometry map, GLM chat template. Identified **Hyper-Connections removal (R1)** as the gating risk (missing from porting.md). Branch `ds4-glm` ready locally; notible checkout exists on `main`; model ~18% downloaded.
 - 2026-06-16: Per user, added **Q2 and Q4 both as Phase 4 build targets** (Q4 = SSD-streaming-only on 256 GB) for a real quality/speed comparison, and the **§3b M1 memory-fit study** (quantized KV is the key lever for Q2 + large context on 256 GB). Pushed groundwork to `origin`; checked out `ds4-glm` on notible (sync loop proven).
@@ -335,3 +375,4 @@ HC state, so no payload version bump for this.
 - 2026-06-16: Built the converter's **safetensors reader** (`stdb`: scans shard headers directly, no `index.json` needed; bf16/f32 → f32) with a `--read` mode. **Validated on real tensors** (norm gains all-positive 0.004-0.22; `q_a_proj`/expert weights symmetric ±0.17, mean≈0 → bf16 decode correct). Next design step: pin the **GGUF schema contract** (metadata + tensor set) jointly with the engine loader, and resolve the absorbed-MLA representation (how GLM's un-absorbed `kv_b` folds into ds4's `attn_q_b`/`attn_kv`/`attn_output`) by reading ds4's attention forward — that gates the converter writer and the engine attention changes.
 - 2026-06-16: **Model download complete** (1.4 TB, 282 shards, 59,585 tensors); `tokenizer.json` + `index.json` now local. `glm-quantize --dry-run` now shows the full GLM→ds4 map satisfied (only the by-design indexer SKIP is partial). MTP = layer 78 (`eh_proj`/`enorm`/`hnorm`/`shared_head.norm`). **Absorption characterized (§3c B):** GLM ⇒ engine `n_head_dim=576` (512 c_kv + 64 rope), `n_value_dim=512`, partial `kv_a_norm`; converter folds `kv_b`. This is real engine work, not just a converter fold — **next: resolve the exact fold/dims against a CPU-slice transformers reference, then write the GGUF schema contract** (gates the writer + engine attention). Mechanical converter pieces (config→metadata, tokenizer arrays, GGUF writer, expert stacking, quant) are unblocked and can proceed for non-attention tensors in parallel.
 - 2026-06-16: **De-risked the #1 risk.** `check_mla_absorption.py` on real weights (server up) shows the MLA absorption fold is exact (rel ~1e-15, layers 0/3/40) — activation-level (native==absorbed) and the weight-level `attn_q_b` fold. **Engine attention config locked:** `n_head_dim=576`, `n_value_dim=512`, partial `kv_a_norm`; converter folds `kv_b`→`q_b`/`o_proj`, `attn_kv` direct. (numpy in `.venv` via brew python3.12.) Next: GGUF schema contract → converter writer (config→metadata, tokenizer arrays, expert stacking, attention fold, Q8 authoring) → engine load changes. Port 8085 still up (no GPU/RAM step reached yet).
+- 2026-06-16 ~21:27: **Entering UNATTENDED mode** (user authorized ~8h; deadline epoch in `/tmp/glm-loop-deadline`, ~05:27 next day). Self-paced via ScheduleWakeup. Drafted the **GGUF schema contract (§5c)** from the exact `config_validate_model` key list. Loop plan each iteration: read this status log → do next chunk (converter writer → engine load deltas → convert+load+validate logits → Q8 ref → imatrix → Q2/Q4 + verify) → commit/push/pull → log → reschedule until deadline. Server stays up except GPU/RAM steps (stop/start `setup-launchagents-tts.sh ... jumbo_server`); **always restart it before stopping the loop.**
