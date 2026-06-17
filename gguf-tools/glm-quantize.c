@@ -22,11 +22,13 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "quants.h"
 
@@ -58,6 +60,27 @@ static void *xcalloc(size_t n, size_t sz) {
     void *p = calloc(n ? n : 1, sz ? sz : 1);
     if (!p) die("out of memory");
     return p;
+}
+
+/* Simple parallel-for over [0,n): splits the range across the CPUs and runs
+ * fn(start,end,ctx) per chunk. Used for the per-head absorption folds and the
+ * per-expert quantization (both embarrassingly parallel, disjoint outputs). */
+typedef void (*range_fn)(int start, int end, void *ctx);
+typedef struct { range_fn fn; void *ctx; int start, end; } pf_job;
+static void *pf_trampoline(void *a) { pf_job *j = a; j->fn(j->start, j->end, j->ctx); return NULL; }
+static void parallel_for(int n, range_fn fn, void *ctx) {
+    if (n <= 0) return;
+    long c = sysconf(_SC_NPROCESSORS_ONLN);
+    int nt = c > 0 ? (int)c : 1;
+    if (nt > n) nt = n;
+    if (nt > 64) nt = 64;
+    if (nt <= 1) { fn(0, n, ctx); return; }
+    pthread_t th[64]; pf_job jobs[64];
+    for (int k = 0; k < nt; k++) {
+        jobs[k] = (pf_job){ fn, ctx, n*k/nt, n*(k+1)/nt };
+        pthread_create(&th[k], NULL, pf_trampoline, &jobs[k]);
+    }
+    for (int k = 0; k < nt; k++) pthread_join(th[k], NULL);
 }
 
 static char *xstrndup(const char *s, size_t n) {
@@ -678,6 +701,24 @@ static tplan *plan_add(tplan **arr, int *n, int *cap, const char *name, ds4q_typ
 
 /* attn_q_b absorbed [out=64*576, in=2048]: per head, top 512 rows = W_UK_h^T @ q_b_nope_h,
  * next 64 rows = q_b_rope_h. (See gguf-tools/check_mla_absorption.py — proven.) */
+typedef struct { const float *qb, *kvb; float *out; } qb_ctx;
+static void qb_range(int h0, int h1, void *c) {
+    const qb_ctx *x = c;
+    for (int h = h0; h < h1; h++) {
+        for (int m = 0; m < 192; m++) {
+            const float *uk = x->kvb + ((size_t)h*448 + m) * 512;   /* W_UK_h row m: [512] */
+            const float *qn = x->qb  + ((size_t)h*256 + m) * 2048;  /* q_b_nope_h row m: [2048] */
+            for (int l = 0; l < 512; l++) {
+                float av = uk[l];
+                float *orow = x->out + ((size_t)h*576 + l) * 2048;
+                for (int j = 0; j < 2048; j++) orow[j] += av * qn[j];
+            }
+        }
+        for (int r = 0; r < 64; r++)
+            memcpy(x->out + ((size_t)h*576 + 512 + r) * 2048,
+                   x->qb + ((size_t)h*256 + 192 + r) * 2048, 2048 * sizeof(float));
+    }
+}
 static float *produce_qb_absorb(stdb *db, int L) {
     char nm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.q_b_proj.weight", L);
@@ -688,25 +729,28 @@ static float *produce_qb_absorb(stdb *db, int L) {
     float *qb = stdb_read_f32(db, gq, &a);    /* [16384,2048] */
     float *kvb = stdb_read_f32(db, gk, &b);   /* [28672,512]  */
     float *out = xcalloc((size_t)36864 * 2048, sizeof(float));
-    for (int h = 0; h < 64; h++) {
-        for (int m = 0; m < 192; m++) {
-            const float *uk = kvb + ((size_t)h*448 + m) * 512;   /* W_UK_h row m: [512] */
-            const float *qn = qb  + ((size_t)h*256 + m) * 2048;  /* q_b_nope_h row m: [2048] */
-            for (int l = 0; l < 512; l++) {
-                float av = uk[l];
-                float *orow = out + ((size_t)h*576 + l) * 2048;
-                for (int j = 0; j < 2048; j++) orow[j] += av * qn[j];
-            }
-        }
-        for (int r = 0; r < 64; r++)
-            memcpy(out + ((size_t)h*576 + 512 + r) * 2048,
-                   qb + ((size_t)h*256 + 192 + r) * 2048, 2048 * sizeof(float));
-    }
+    qb_ctx ctx = { qb, kvb, out };
+    parallel_for(64, qb_range, &ctx);
     free(qb); free(kvb);
     return out;
 }
 
 /* attn_output absorbed [out=6144, in=64*512]: per head, cols [h*512..] = o_proj_h @ W_UV_h. */
+typedef struct { const float *op, *kvb; float *out; } o_ctx;
+static void o_range(int h0, int h1, void *c) {
+    const o_ctx *x = c;
+    for (int h = h0; h < h1; h++) {
+        for (int i = 0; i < 6144; i++) {
+            const float *opi = x->op + (size_t)i*16384 + (size_t)h*256;  /* [256] */
+            float *orow = x->out + (size_t)i*32768 + (size_t)h*512;       /* [512] */
+            for (int cc = 0; cc < 256; cc++) {
+                float av = opi[cc];
+                const float *uv = x->kvb + ((size_t)h*448 + 192 + cc) * 512;  /* W_UV_h row cc: [512] */
+                for (int l = 0; l < 512; l++) orow[l] += av * uv[l];
+            }
+        }
+    }
+}
 static float *produce_o_absorb(stdb *db, int L) {
     char nm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.o_proj.weight", L);
@@ -717,19 +761,26 @@ static float *produce_o_absorb(stdb *db, int L) {
     float *op = stdb_read_f32(db, go, &a);    /* [6144,16384] */
     float *kvb = stdb_read_f32(db, gk, &b);   /* [28672,512]  */
     float *out = xcalloc((size_t)6144 * 32768, sizeof(float));
-    for (int h = 0; h < 64; h++) {
-        for (int i = 0; i < 6144; i++) {
-            const float *opi = op + (size_t)i*16384 + (size_t)h*256;  /* [256] */
-            float *orow = out + (size_t)i*32768 + (size_t)h*512;       /* [512] */
-            for (int c = 0; c < 256; c++) {
-                float av = opi[c];
-                const float *uv = kvb + ((size_t)h*448 + 192 + c) * 512;  /* W_UV_h row c: [512] */
-                for (int l = 0; l < 512; l++) orow[l] += av * uv[l];
-            }
-        }
-    }
+    o_ctx ctx = { op, kvb, out };
+    parallel_for(64, o_range, &ctx);
     free(op); free(kvb);
     return out;
+}
+
+/* Per-expert quantization (parallel across the 256 experts of a MoE tensor). */
+typedef struct { stdb *db; const char *tmpl; ds4q_type type; int64_t per_rows, ncols; size_t row_bytes; uint8_t *out; } exp_ctx;
+static void exp_range(int e0, int e1, void *c) {
+    const exp_ctx *x = c;
+    for (int E = e0; E < e1; E++) {
+        char nm[256]; snprintf(nm, sizeof(nm), x->tmpl, E);
+        const gtensor *g = stdb_find(x->db, nm);
+        if (!g) { fprintf(stderr, "glm-quantize: missing %s\n", nm); exit(1); }
+        int64_t ne = 0; float *src = stdb_read_f32(x->db, g, &ne);
+        if (ne != x->per_rows * x->ncols) { fprintf(stderr, "glm-quantize: %s size mismatch\n", nm); exit(1); }
+        ds4q_quantize_chunk(x->type, src, x->out + (size_t)E * x->per_rows * x->row_bytes,
+                            0, x->per_rows, x->ncols, NULL);
+        free(src);
+    }
 }
 
 static tplan *build_plan(int n_layers, int *count) {
@@ -818,20 +869,14 @@ static void write_gguf_full(const char *out, const char *hf_dir, int n_layers) {
         ds4q_quantize_init(t->type);
 
         if (t->kind == SRC_EXPERT) {
-            /* stream 256 experts: the full stacked tensor is too big to hold in RAM */
+            /* quantize all experts in parallel into one buffer (Q4_K output ~1.8 GB), then write */
             int64_t per_rows = t->ne[1];
             size_t rs = ds4q_row_size(t->type, ncols);
-            for (int E = 0; E < (int)t->ne[2]; E++) {
-                char nm[256]; snprintf(nm, sizeof(nm), t->hf, E);
-                const gtensor *g = stdb_find(&db, nm);
-                if (!g) { fprintf(stderr, "glm-quantize: missing %s\n", nm); exit(1); }
-                int64_t ne = 0; float *src = stdb_read_f32(&db, g, &ne);
-                if (ne != per_rows * ncols) { fprintf(stderr, "glm-quantize: %s size mismatch\n", nm); exit(1); }
-                void *dst = xmalloc(rs * (size_t)per_rows);
-                size_t got = ds4q_quantize_chunk(t->type, src, dst, 0, per_rows, ncols, NULL);
-                fwrite(dst, 1, got, f); dpos += got;
-                free(dst); free(src);
-            }
+            size_t total = (size_t)t->ne[2] * (size_t)per_rows * rs;
+            uint8_t *out = xmalloc(total);
+            exp_ctx ctx = { &db, t->hf, t->type, per_rows, ncols, rs, out };
+            parallel_for((int)t->ne[2], exp_range, &ctx);
+            fwrite(out, 1, total, f); dpos += total; free(out);
         } else {
             float *src;
             int64_t nrows = plan_nrows(t);
