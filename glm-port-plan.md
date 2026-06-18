@@ -293,7 +293,7 @@ Legend: [x] done · [~] partial · [ ] not started.
 ### Phase 3 — Metal + multi-token + server ← **WE ARE HERE**
 - [x] **Metal single-token decode graph (HC=1) — VALIDATED vs CPU** (2026-06-17): `--metal-graph-full-test` gpu_top==cpu_top==154822, logits rms-diff ~0.01. On GPU: HC bypass, 576/512 absorbed attention (no sinks, kq 1/√256, plain o_proj, partial kv_a_norm, no inverse-rope), dense FFN <3, shared expert, output head. Kernel: `kernel_flash_attn_ext_vec_f16_dk576_dv512` (NE=2).
 - [x] **8-expert Metal routed MoE — VALIDATED vs CPU** (2026-06-17): routed experts (≈97% FLOPs) now run on the GPU. The baseline id-based MoE path turned out to be already n_expert-general (per-`(expert,token)` dispatch; `ds4_gpu_encode_moe_sum_experts` reduces any count via a binary add chain) — **no `sum8` kernel was needed**; the only 6-hardwiring was the `n_expert > 6` guard, now `> DS4_GPU_MAX_EXPERT_USED`. GLM decode layer selects on the CPU (`metal_graph_glm_cpu_router`, sigmoid noaux_tc top-8 -> `g->router_selected/weights`) and runs experts on Metal via `ds4_gpu_routed_moe_one_tensor`. `--metal-graph-full-test` on Q2: gpu_top==cpu_top==154822, logits rms-diff 0.0136. `DS4_GLM_CPU_ROUTED_MOE=1` forces the v1 all-CPU path (A/B fallback). DeepSeek 6-expert fast paths bit-identical.
-- [~] **Multi-token generation:** full-attention KV (`n_swa=0`) + sequential-decode prefill + multi-EOS landed; `--temp 0` reaches the decode loop end-to-end (~8.8 tok/s) but output is **garbage — GLM multi-row attention (`n_raw>1`/pos>0) is broken** (single-token was the only validated case; see §6). Needs a 2-token GPU-vs-CPU isolation to fix. The default (temp>0) session/batch prefill path SIGSEGVs for GLM (Metal batch prefill not adapted — later item).
+- [x] **Multi-token generation (greedy) WORKS:** full-attention KV (`n_swa=0`) + sequential-decode prefill + multi-EOS; the multi-row attention Q-stride bug is **fixed** (`--glm-attn-test` exact to n_raw=256) and `--temp 0` now generates coherent, correct text end-to-end (~8.7 tok/s). Remaining: the default (temp>0) sampled path still SIGSEGVs in the GLM-unadapted Metal batch prefill, so sampling needs a GLM batch prefill (or routing sampled decode through the sequential driver); greedy alone loops/degrades on long output (argmax + Q2).
 - [~] Tokenizer + chat template: `[gMASK]<sop>` framing + reasoning-effort + `<|assistant|><think>` gen prompt + multi-EOS stop set **done and ID-verified vs the real tokenizer**; `<tool_call>` render/parse + the multi-turn server chat builders (`ds4_chat_*`, `ds4_server.c`) still pending (§1b)
 - [ ] 🔴 Server answers a real prompt end to end + measure tokens/sec on notible
 
@@ -546,6 +546,28 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (**multi-row attention bug FOUND + FIXED -- multi-token generation now produces coherent,
+  correct output**): The garbage was a one-line stride bug in the GLM flash-attn encoder
+  (`ds4_gpu_encode_flash_attention_raw_heads_glm`): the **query** strides `nb01/nb02/nb03` (which the
+  vec kernel uses as `q += iq2*nb02`) were set from `val_row_bytes` (512*4) instead of `key_row_bytes`
+  (576*4). GLM's absorbed MLA has `key_dim=576 != value_dim=512`, so every head past head 0 read its
+  query from the wrong offset (drift 64 floats/head) -> corrupt q.k scores. **Invisible at `n_raw==1`**
+  (softmax weight is 1.0 regardless of the score), which is why the single-token forward validated but
+  any pos>0 decode was garbage. DeepSeek never hit it (key==value==512). **Found by a new standalone
+  `--glm-attn-test`** (no model load, runs locally in seconds): random `q[64x576]` + `KV[n_raw x 576]`
+  vs a CPU `softmax(q.k/sqrt(256)).v[:512]` reference. The diagnostic showed *whole heads* wrong (not
+  dims) -> pointed straight at the per-head query stride. Before: n_raw=1 matched (1e-4), n_raw>=2 max
+  ~0.2-0.37. After: **n_raw 1..256 all match within f16 precision (max <2e-4)** -- covers the C=32
+  block boundary and the multi-workgroup split + reduce. **End-to-end** (`glm-5.2-q2.gguf -p "List the
+  first five planets from the Sun" -n 220 --temp 0 -c 2048`): the model now answers **"The first five
+  planets from the Sun are Mercury, Venus, Earth, Mars, Jupiter..."** (coherent + factually correct) at
+  ~8.7 tok/s. It then loops/degrades on continued greedy decoding -- expected argmax-repetition + Q2
+  quantization, **not** an attention bug (the kernel is exact to n_raw=256). Keep `--glm-attn-test` as a
+  fast regression. **Multi-token generation works on Metal.** Remaining for quality/usability: the
+  default (temp>0) sampled path still routes through the GLM-unadapted Metal batch prefill
+  (`metal_graph_prefill_layer_major`) which SIGSEGVs -- so sampling (which would break the greedy loop)
+  needs either a GLM batch prefill or routing the sampled path through the sequential-decode driver;
+  plus the server wiring + `<tool_call>` for the finale.
 - 2026-06-17 (**multi-token generation + GLM chat I/O implemented; blocked on a multi-row attention
   bug**): Landed three things toward usable generation. (1) **GLM chat I/O** (commit cherry-picked from
   a parallel subagent): `encode_chat_prompt` now emits the real GLM frame `[gMASK]<sop>` + optional
