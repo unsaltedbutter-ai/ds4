@@ -23466,7 +23466,13 @@ static int generate_raw_swa_cpu(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (token == vocab->eos_id) break;
+        bool is_stop = (token == vocab->eos_id);
+        if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+            is_stop = is_stop ||
+                      (vocab->user_id >= 0 && token == vocab->user_id) ||
+                      (vocab->observation_id >= 0 && token == vocab->observation_id);
+        }
+        if (is_stop) break;
 
         if (emit) emit(emit_ud, token);
         n_generated++;
@@ -23632,7 +23638,13 @@ static int generate_metal_graph_raw_swa(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (token == vocab->eos_id) break;
+        bool is_stop = (token == vocab->eos_id);
+        if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+            is_stop = is_stop ||
+                      (vocab->user_id >= 0 && token == vocab->user_id) ||
+                      (vocab->observation_id >= 0 && token == vocab->observation_id);
+        }
+        if (is_stop) break;
 
         if (emit) emit(emit_ud, token);
         n_generated++;
