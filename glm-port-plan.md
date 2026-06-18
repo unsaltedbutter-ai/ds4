@@ -16,9 +16,9 @@ log at the bottom every working session.
 | Thing | Location |
 |---|---|
 | Local code (this machine) | `~/Documents/ds4`, branch **`ds4-glm`** (based on `main`, clean) |
-| Remote code (notible) | `notible:/Users/notible/Documents/ds4-glm` (checkout exists, currently on `main`) |
-| Production DeepSeek (do not disturb) | `notible:/Users/notible/Documents/ds4` on `main`, server port 8085 |
-| Model weights | `notible:/Volumes/4TB-1/glm-5.2/` (downloading — ~18% / 31 of 282 shards / 276 GB; 3.3 TB free) |
+| Remote code (notible) | `notible:/Users/notible/Documents/ds4-glm`, on branch **`ds4-glm`** (kept in sync via `git pull`) |
+| Production DeepSeek (do not disturb) | `notible:/Users/notible/Documents/ds4` on `main`, server port 8085 (`jumbo_server`, launchd) |
+| Model weights | HF shards `notible:/Volumes/4TB-1/glm-5.2/` (complete); built GGUFs `notible:/Volumes/4TB-1/glm-5.2-q2.gguf` (218.9 GiB) + `glm-5.2-q4.gguf` (408.7 GiB) |
 | Sync mechanism | commit on this machine → push `origin` → `git pull` on notible |
 | Git remotes | `origin` = `unsaltedbutter-ai/ds4` (fork), `upstream` = `antirez/ds4` |
 
@@ -403,6 +403,13 @@ Validation: once the Metal forward runs, compare its logits to the CPU forward (
 test harnesses) on a few tokens — they should match within quant/precision noise.
 
 ## 7b. Known gaps / cautions for whoever continues
+
+> **UPDATE 2026-06-17 (read §6 top first):** the Metal **single-token decode, 8-expert MoE, and
+> greedy multi-token generation all work and are validated.** The multi-row attention bug that this
+> section's cautions hinted at was a query-stride error (576 vs 512), now fixed; rope at pos>0 is
+> empirically confirmed by working generation. The bullets below are historical except where they
+> name still-open work (the **CPU** generation path, the **Metal batch prefill** for temp>0/server,
+> and bit-exact-vs-reference checks).
 
 - **RoPE convention: VERIFIED OK for GLM.** ds4's `rope_tail` (ds4.c ~7010, `kernel_dsv4_rope_tail_f32`)
   rotates *adjacent pairs* `tail[i],tail[i+1]` — the **interleaved** convention, which matches GLM's
