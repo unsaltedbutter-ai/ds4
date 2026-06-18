@@ -555,6 +555,26 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (**GLM Q4 GPU expert streaming WORKS on the CLI + server; Q4 is fundamentally disk-bound on
+  256 GB**): Built the full GLM Q4 GPU streaming path: `slots8` Q4_K kernels (pair-swiglu + sum8, clones of
+  the validated slots6/sum6) + encoders + `ds4_gpu_glm_streaming_routed_moe_tensor` which routes on the CPU
+  (ids locate experts in the mmap), stages the 8 selected experts into a resident slab each MoE layer, and
+  runs slots8 on the GPU.  Wired into the GLM decode layer under `--ssd-streaming` + Q4_K (else CPU routed
+  fallback), + CUDA stubs.  **Validated on notible (CLI + server):** coherent output (Mercury..Jupiter), the
+  slots8 kernels compile + run, the **server answers a Q4-streamed prompt end to end** (ready in 6s, decode
+  through the streaming path).  **Speed: ~0.42 tok/s cold, ~0.76 warm** (vs ~0.3 CPU).  A warm-page-cache
+  A/B (0.37->0.76 gen, 0.13->0.51 prefill) confirms **Q4 is disk-bound**: 389 GiB of experts can't be
+  resident on 256 GB, so the per-layer expert load (cold->disk) dominates, not GPU compute, and single-token
+  decode has little compute to overlap the load with.  Also fixed `DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER`
+  61->78 (GLM has 78 layers; the cache rejected layer 61+).  **Tried** swapping the per-layer memcpy for the
+  DeepSeek resident slab cache (peek + 6-wide load in 2 groups) to skip the copy + exploit usage skew, but it
+  **thrashed** (0.06 tok/s -- the 6-expert-oriented per-layer cap/eviction doesn't fit GLM's 8-expert
+  pattern); **reverted** to the faster memcpy path (kept in git for a proper GLM-specific cache later).
+  **Conclusion:** Q4 streaming is functional (server/agent) but disk-bound (~0.76 warm); interactive speed
+  needs a non-thrashing GLM expert cache (exploit skew) + load/compute overlap -- substantial.  For FAST GLM
+  serving, Q2 (resident, ~11.6 tok/s) is the practical target; Q4 streaming is for quality/validation.
+  Remaining: a GLM-native LRU expert cache, prefetch/overlap, and 8-bit latent KV (Phase 4, independent of
+  the disk wall -- shrinks KV for larger Q4/Q2 context).
 - 2026-06-17 (**Phase 1 of fast Q4 GPU streaming begun: slots8 Q4_K kernels landed (foundation)**): Goal
   (per user): make the ds4 server + agent fast on Q4 streamed from SSD -- build it, cache it, then KV-quant.
   DeepSeek's streaming MoE dispatch is slots6/sum6 (6 experts hardwired: `n_expert==6` gates + `for i<6`
