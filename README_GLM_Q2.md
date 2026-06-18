@@ -267,63 +267,107 @@ size that stays resident.
    it **both thinking-on and thinking-off** (`reasoning_effort: none` via the server): the
    2026-06-18 baseline ran thinking-on and much of the looping was inside the reasoning
    trace, so thinking-off isolates how much of the degeneration is reasoning-loop vs answer.
-3. **NLL vs reference.** Target-token negative-log-likelihood on a fixed prompt set:
-   - **Anchor = Q4** (local, high-quality, same engine). Q4 stays coherent where Q2 loops,
-     so it is a usable local pseudo-reference for first-token-match rate and **avg greedy
-     LCP** (longest common prefix) — the metrics in the DeepSeek imatrix table.
-   - **External = official GLM-5.2 API** continuations for true NLL, via
-     `gguf-tools/quality-testing/` (`collect_official.py` → `score_official.c` →
-     `compare_scores.py`: scores local GGUFs against API continuations by target-token NLL,
-     with `prompts.jsonl`). This is the gold metric — but the harness is DeepSeek-shaped;
-     verify/adapt it for GLM framing and the GLM API before trusting numbers.
-   - For quick local A/Bs without the API, a greedy/top-logit comparator is handy; the
-     DeepSeek imatrix README cites `misc/quant_eval.c`, but that file is **not present** in
-     this tree — it would need to be ported/added (or just diff greedy continuations).
-4. **Speed + fit.** Record load time, decode tok/s, and resident headroom at `-c 2048`.
+3. **Greedy fidelity vs Q4** (the quantitative metric — see the metric note below). Q4 is the
+   high-quality local anchor (same engine). For each prompt, generate Q4 greedy once (cache
+   it), then generate each Q2 candidate greedy and measure **agreement with Q4** (longest
+   common token prefix / token-overlap). Higher agreement = less quantization damage. This is
+   the DeepSeek imatrix table's "greedy LCP" metric, and it is in-distribution and sensitive.
+   For an external gold metric, `gguf-tools/quality-testing/` scores against official-API
+   continuations by NLL, but it is DeepSeek-shaped and needs GLM adaptation.
+4. **Speed + fit.** Record load time, decode tok/s, file size, and resident-vs-streaming.
 
-Metrics recorded per candidate: file size (GiB), resident fit (Y/N at `-c 2048` and a target
-ctx), decode tok/s, avg NLL, first-token-match rate, avg greedy LCP vs Q4, and the
-decoherence battery result.
+> **Metric note (2026-06-18): raw-prose perplexity does NOT discriminate quant quality for
+> GLM — do not use it as the primary metric.** I built `--perplexity-file` scoring on held-out
+> English (`scripts/glm-ppl-heldout.txt`) and found **Q4 ppl ≈ 3079 and Q2 ppl ≈ 3184** on the
+> same text (avg_nll 8.03 vs 8.07) — a near-lossless Q4 scores essentially the same catastrophic
+> ppl as Q2. The logprob math is correct (verified) and tokenization is healthy (~5 char/token),
+> so this is not a bug: GLM-5.2 is a heavily post-trained *reasoning* model and is deeply out of
+> distribution on un-framed prose continuation, so its own uncertainty (high entropy everywhere)
+> swamps the quantization signal. Prepending the `[gMASK]<sop>` BOS frame (now in the harness)
+> only moved it 6310→5227. **Conclusion:** use greedy-fidelity-vs-Q4 + the behavioral battery,
+> which are in the model's competence zone, as the real metrics. Prose-ppl is kept only as a
+> weak tertiary (it is deterministic, so a *large* consistent move would still be a signal).
+
+Metrics recorded per candidate: file size (GiB), resident vs streaming, decode tok/s, greedy
+agreement vs Q4, the decoherence battery result, and (tertiary) prose avg_nll.
 
 ### 4.2 Build/iterate discipline
 
 - **Plumbing first, quality second.** Validate a recipe change with a `--layers 12` partial
   build (load + quant-size correctness, seconds–minutes) before a full ~40–60 min build.
-- **Disk budget.** Each full Q2 variant is ≈219 GiB; `/Volumes/4TB-1` already holds q2 (219)
-  + q4 (409). Keep at most ~2–3 candidate GGUFs at once; delete losers.
+- **Disk budget.** Candidate GGUFs all live on `/Volumes/4TB-1` (≈3.4 TB free after q2+q4),
+  built with `scripts/glm-q2-build.sh` (prod-safe). Keep ~2–3 at once; delete losers.
+- **Larger-than-RAM is allowed.** Per the user, a Q2 that exceeds 256 GB and streams a bit is
+  acceptable for better quality — so higher-bit recipes are in scope (with a streaming speed
+  cost), not just resident ones.
 - **Gate on the eval, one variable at a time.** Don't stack recipe changes within a single
   build or we can't attribute the delta.
 
-### 4.3 Proposed order (cheapest informative experiment first)
+> **Kernel constraint (2026-06-18, from `metal/moe.metal`).** The gate/up fused `pair_swiglu`
+> MoE kernel exists only for **IQ2_XXS and Q4_K** — there is **no Q2_K pair_swiglu**. So
+> gate/up can be IQ2_XXS (2.06 bpw, resident ~219 GB) or Q4_K (4.5 bpw, ~366 GB ≈ full Q4),
+> with nothing in between without a new kernel. The `down` proj is a plain id-matmul and
+> supports Q2_K / Q4_K / IQ2_XXS / Q8_0. **Implication:** the only sub-Q4 gate/up option is
+> IQ2_XXS, which is exactly the quant that most needs a good imatrix — so **Option A (real
+> imatrix) is the main lever for a better *resident* Q2.** A Q2_K-gate/up "B1" would need a new
+> `q2_K_pair_swiglu` kernel first.
 
-1. **A0** — synthetic importance on `down` too. Free; tells us if `down` weighting helps.
-2. **B2** — a small sensitivity-aware Q4-layer set (e.g. first 2 + last 2 MoE layers). Cheap
-   recipe edit; targeted quality at modest RAM.
-3. **A** — port `--imatrix` to `glm-quantize.c`, re-point the collector to GLM sequential
-   decode, collect a small (~32k–130k token) GLM imatrix, rebuild gate/up + down with it.
-   The main event.
-4. **D** then **B2-extended** — if we want more Q4 layers than budget allows, add 8-bit KV to
-   free RAM, then widen the Q4 layer set.
-5. **C** — only if A+B+D leave quality short; implement IQ2_S (gate/up) and/or Q3_K (down)
-   with matching Metal kernels.
+### 4.3 Order (revised after the metric + kernel findings)
+
+1. **A0** — `down` (Q2_K) gets the synthetic importance it lacked (resident, same ~219 GB).
+   Cheap first check; *building now*.
+2. **A** — the main event: re-point the imatrix collector at GLM sequential decode, port
+   `--imatrix` into `glm-quantize.c`, collect a small (~32k–130k token) GLM imatrix, rebuild
+   IQ2_XXS gate/up + Q2_K down weighted by it. Stays resident (~219 GB) and fast — the right
+   lever given the kernel constraint.
+3. **down → Q4_K** (gate/up still IQ2_XXS, ~275 GB, streams via the CPU-routed mmap path since
+   the GPU slots8 stream needs Q4_K gate/up). Tests whether spending bits on the most
+   sensitive projection helps; accepts the streaming speed hit.
+4. **q2_K_pair_swiglu kernel → B1** (gate/up Q2_K, ~251 GB near-resident) — only if A leaves
+   quality short; needs a new Metal kernel (clone the iq2_xxs/q4_K pair_swiglu).
+5. **C / D** — new low-bit types (IQ2_S/Q3_K) and 8-bit KV, last resort.
 
 ### 4.4 Results tracker (newest first; fill as we execute)
 
-| Date | Variant | Size GiB | Fit | tok/s | NLL | 1st-tok | greedy LCP | Battery | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| 2026-06-18 | **baseline** (current Q2: IQ2_XXS g/u synth-imat, Q2_K down unweighted) | 218.9 | Y | ~11.6 | — | — | — | _(see §2.3)_ | reference point |
+Prose `avg_nll` is the held-out-corpus number (tertiary metric; see the §4.1 note — it barely
+moves between Q4 and Q2, so treat only *large* changes as signal). Greedy-vs-Q4 is the primary
+quantitative metric (TBD as candidates land).
+
+| Date | Variant | Size | Fit | tok/s | prose avg_nll | greedy-vs-Q4 | Battery | Notes |
+|---|---|---|---|---|---|---|---|---|
+| 06-18 | **baseline** Q2 (IQ2_XXS g/u synth-imat, Q2_K down unweighted) | 218.9 GiB | resident | ~11.4 | 8.56 (1258 tok) / 8.07 (320 tok) | ref | loops (§2.3) | reference point |
+| 06-18 | _anchor_ Q4 (Q4_K experts) | 408.7 GiB | streaming | ~0.76 | **8.03** (320 tok) | — | coherent | Q4≈Q2 on prose → ppl uninformative (§4.1 note) |
+| 06-18 | A0 (down Q2_K weighted) | _building_ | resident | — | — | — | — | iter 1 |
 
 ---
 
-## 5. Pointers
+## 5. Campaign log (newest first)
+
+- **2026-06-18 — metric pivot + kernel reality; A0 building.** Built the perplexity harness and
+  hit the wall that **raw-prose ppl is uninformative for GLM** (Q4 3079 ≈ Q2 3184 on 320 tok;
+  see §4.1 note) — switched the primary metric to greedy-fidelity-vs-Q4 + the behavioral battery.
+  Fixed the harness to prepend `[gMASK]<sop>` (full-attention poisons an un-framed position 0).
+  Mapped the **kernel constraint**: gate/up `pair_swiglu` exists only for IQ2_XXS/Q4_K (no Q2_K),
+  so a better *resident* Q2 hinges on **Option A (real imatrix)** for IQ2_XXS. Added converter
+  `--gu-type/--down-type` flags and a prod-safe build runner. Launched **A0** (down Q2_K weighted)
+  as the cheap first check; implementing the GLM imatrix collector (Option A) next.
+
+## 6. Pointers
 
 - Converter: `gguf-tools/glm-quantize.c` (`--q2` at `:1089`, `build_plan` at `:801`,
   per-expert quant at `:770`, synthetic importance at `:783`).
 - Quantizers: `gguf-tools/quants.c` (type traits `:39`; Q2_K `:641`, IQ2_XXS `:997`,
   Q4_K `:506`).
-- Imatrix (DeepSeek, to be ported): loader in `gguf-tools/deepseek4-quantize.c`; collector
-  `ds4_engine_collect_imatrix` (`ds4.c:25844`); dataset + docs `gguf-tools/imatrix/`.
-- Eval: `gguf-tools/quality-testing/` (present: `collect_official.py`, `score_official.c`,
-  `compare_scores.py`, `prompts.jsonl`; DeepSeek-shaped — adapt for GLM). `misc/quant_eval.c`
+- Imatrix (Option A): loader `imatrix_load`/`imatrix_find` in `gguf-tools/deepseek4-quantize.c`
+  (to port into `glm-quantize.c`); collector `ds4_engine_collect_imatrix` (`ds4.c:25844`) +
+  `imatrix_collect_layer_batch` (`:20788`, reads the *batch* buffers — needs a single-token GLM
+  variant reading `g->ffn_norm`/`g->routed_mid`/`g->router_selected`); `.dat` save format
+  `imatrix_collector_save` (`:20877`); dataset + docs `gguf-tools/imatrix/`.
+- Perplexity / logprobs: `run_perplexity_file` (`ds4_cli.c:790`, `--perplexity-file`, now
+  GLM-BOS-framed); `--dump-logprobs`; `ds4_session_token_logprob` (`ds4.c:27908`).
+- Eval: `gguf-tools/quality-testing/` (`collect_official.py`/`score_official.c`/
+  `compare_scores.py`/`prompts.jsonl`; DeepSeek-shaped — adapt for GLM). `misc/quant_eval.c`
   is referenced by the imatrix README but is not in this tree.
-- Characterization: `scripts/glm-q2-characterize.sh`.
+- Scripts (`scripts/`): `glm-q2-build.sh` (prod-safe candidate build → /Volumes/4TB-1),
+  `glm-q2-eval.sh MODEL LABEL` (prod-down ppl + battery; `PPLONLY=1` for ppl only),
+  `glm-q2-characterize.sh` (battery), `glm-ppl-heldout.txt` (held-out ppl corpus).
