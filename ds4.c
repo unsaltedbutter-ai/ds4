@@ -20864,7 +20864,12 @@ static bool imatrix_collect_layer_batch(
 static bool imatrix_collect_layer_glm_one(void *collector, ds4_gpu_graph *g, uint32_t il) {
     ds4_imatrix_collector *c = collector;
     if (!c || il >= (uint32_t)DS4_N_LAYER) return true;
+    const bool dbg = getenv("DS4_IMATRIX_DEBUG") != NULL;
+    if (dbg) fprintf(stderr, "imat il=%u end_commands\n", il);
     if (ds4_gpu_end_commands() == 0) return false;
+    if (dbg) fprintf(stderr, "imat il=%u reads (ffn_norm=%p sel=%p mid=%p bufs n=%p s=%p m=%p)\n",
+                     il, (void*)g->ffn_norm, (void*)g->router_selected, (void*)g->routed_mid,
+                     (void*)c->ffn_norm_buf, (void*)c->selected_buf, (void*)c->routed_mid_buf);
     const bool read_ok =
         ds4_gpu_tensor_read(g->ffn_norm, 0, c->ffn_norm_buf,
                             (uint64_t)DS4_N_EMBD * sizeof(c->ffn_norm_buf[0])) != 0 &&
@@ -20873,6 +20878,7 @@ static bool imatrix_collect_layer_glm_one(void *collector, ds4_gpu_graph *g, uin
         ds4_gpu_tensor_read(g->routed_mid, 0, c->routed_mid_buf,
                             (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_buf[0])) != 0;
     if (!read_ok) { ds4_gpu_begin_commands(); return false; }
+    if (dbg) fprintf(stderr, "imat il=%u accumulate sel0=%d\n", il, c->selected_buf[0]);
 
     const float *x = c->ffn_norm_buf;
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) c->sq_tmp[i] = x[i] * x[i];
