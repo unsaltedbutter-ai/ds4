@@ -15273,8 +15273,28 @@ static bool metal_graph_encode_decode_layer_glm(
             const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
             const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
             const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
-            if (ok) ok = metal_graph_glm_cpu_router(g, model, layer);
-            GLM_STEP("moe_router_cpu");
+            /* Router selection: GPU sigmoid noaux_tc top-8 into
+             * g->router_selected/weights, encoded into the in-flight command
+             * buffer so there is no per-MoE-layer CPU<->GPU sync (the v1 GLM path
+             * read ffn_norm back and selected on the host every layer).  The MoE
+             * below reads the same GPU buffers within the same command buffer.
+             * DS4_GLM_CPU_ROUTER forces the validated v1 host router for A/B. */
+            if (getenv("DS4_GLM_CPU_ROUTER") != NULL) {
+                if (ok) ok = metal_graph_glm_cpu_router(g, model, layer);
+                GLM_STEP("moe_router_cpu");
+            } else {
+                if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model,
+                                                             layer->ffn_gate_inp,
+                                                             DS4_N_EMBD, DS4_N_EXPERT,
+                                                             g->ffn_norm, 1);
+                if (ok) ok = ds4_gpu_router_select_glm_tensor(g->router_selected, g->router_weights,
+                                                              g->router_probs, model->map, model->size,
+                                                              layer->ffn_exp_probs_b->abs_offset,
+                                                              DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                                                              DS4_EXPERT_WEIGHT_SCALE,
+                                                              g->router_logits) != 0;
+                GLM_STEP("moe_router_gpu");
+            }
             if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                        g->routed_gate, g->routed_up, g->routed_mid,
                                                        g->routed_down,

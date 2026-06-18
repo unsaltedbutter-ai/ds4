@@ -803,6 +803,21 @@ int ds4_gpu_router_select_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits);
 
+/* GLM-5.2 router selection (sigmoid noaux_tc, top-k, normalized x scale) on the
+ * GPU, dropping the per-MoE-layer CPU sync.  Metal-only; the CUDA build links a
+ * stub (GLM on CUDA is unsupported). */
+int ds4_gpu_router_select_glm_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        const ds4_gpu_tensor *logits);
+
 int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,

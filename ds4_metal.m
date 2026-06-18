@@ -22177,7 +22177,8 @@ static int ds4_gpu_encode_router_select(
         uint32_t              n_expert_used,
         float                 expert_weight_scale,
         bool                  has_bias,
-        bool                  hash_mode) {
+        bool                  hash_mode,
+        bool                  sigmoid_scoring) {
     id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
     id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
     id<MTLBuffer> probsbuf = ds4_gpu_tensor_buffer(probs);
@@ -22296,6 +22297,22 @@ static int ds4_gpu_encode_router_select(
                                              probs_off,
                                              n_expert,
                                              1,
+                                             1,
+                                             0.0f,
+                                             0.0f);
+    } else if (sigmoid_scoring) {
+        /* GLM scoring_func = sigmoid (noaux_tc); a single unary op, vs DeepSeek's
+         * sqrt(softplus(x)).  The bias add / top-k / weight gather / normalize /
+         * scale below are scoring-agnostic, so only this op differs. */
+        ok = g_unary_sigmoid_pipeline &&
+             ds4_gpu_encode_unary_f32_rows(cb,
+                                             g_unary_sigmoid_pipeline,
+                                             logitsbuf,
+                                             logits_off,
+                                             probsbuf,
+                                             probs_off,
+                                             n_expert,
+                                             n_tokens,
                                              1,
                                              0.0f,
                                              0.0f);
@@ -22535,7 +22552,85 @@ int ds4_gpu_router_select_tensor(
                                                       n_expert_used,
                                                       expert_weight_scale,
                                                       has_bias && !hash_mode,
-                                                      hash_mode);
+                                                      hash_mode,
+                                                      false);
+        if (!had_batch) {
+            ok = ds4_gpu_end_commands() != 0 && ok;
+        }
+        if (!ok) return 0;
+    }
+
+    return 1;
+}
+
+/* GLM-5.2 router selection on the GPU, removing the per-MoE-layer CPU sync the v1
+ * GLM path used (read ffn_norm back, top-k on the host, upload selected/weights).
+ * GLM always carries the noaux_tc bias (exp_probs_b) and never hash-routes, so
+ * this is a focused single-token wrapper over ds4_gpu_encode_router_select with
+ * sigmoid scoring; bias add / flat top-k / weight gather / normalize / scale are
+ * scoring-agnostic and shared with DeepSeek.  The logits tensor already holds the
+ * current token's router logits, so no token index is needed.  DeepSeek's
+ * ds4_gpu_router_select_tensor signature is left untouched (it has a CUDA impl);
+ * GLM on CUDA is unsupported and carries a stub. */
+int ds4_gpu_router_select_glm_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        const ds4_gpu_tensor *logits) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!selected || !weights || !probs || !logits || !model_map ||
+        n_expert == 0 || n_expert_used == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> logitsbuf = ds4_gpu_tensor_buffer(logits);
+        if (!logitsbuf ||
+            ds4_gpu_tensor_bytes(logits) < (uint64_t)n_expert * sizeof(float) ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_expert_used * sizeof(int) ||
+            ds4_gpu_tensor_bytes(weights) < (uint64_t)n_expert_used * sizeof(float) ||
+            ds4_gpu_tensor_bytes(probs) < (uint64_t)n_expert * sizeof(float)) {
+            fprintf(stderr, "ds4: GLM Metal router select received undersized buffers\n");
+            return 0;
+        }
+
+        uint64_t bias_inner = 0;
+        const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+        id<MTLBuffer> biasbuf =
+            ds4_gpu_wrap_model_range(model_map, model_size, bias_offset, bias_bytes, &bias_inner);
+        if (!biasbuf) return 0;
+
+        const bool had_batch = g_batch_cb != nil;
+        if (!had_batch && ds4_gpu_begin_commands() == 0) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        const int32_t token_i32 = 0;
+        int ok = cb &&
+                 ds4_gpu_encode_router_select(cb,
+                                                      selected,
+                                                      weights,
+                                                      probs,
+                                                      logitsbuf,
+                                                      ds4_gpu_tensor_offset(logits),
+                                                      biasbuf,
+                                                      (NSUInteger)bias_inner,
+                                                      nil,
+                                                      0,
+                                                      nil,
+                                                      0,
+                                                      &token_i32,
+                                                      0,
+                                                      1,
+                                                      n_expert,
+                                                      n_expert_used,
+                                                      expert_weight_scale,
+                                                      true,   /* has_bias: noaux_tc exp_probs_b */
+                                                      false,  /* hash_mode */
+                                                      true);  /* sigmoid_scoring */
         if (!had_batch) {
             ok = ds4_gpu_end_commands() != 0 && ok;
         }
@@ -22631,7 +22726,8 @@ int ds4_gpu_router_select_batch_tensor(
                                                       n_expert_used,
                                                       expert_weight_scale,
                                                       has_bias && !hash_mode,
-                                                      hash_mode);
+                                                      hash_mode,
+                                                      false);
         if (!had_batch) {
             ok = ds4_gpu_end_commands() != 0 && ok;
         }

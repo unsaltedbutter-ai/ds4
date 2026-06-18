@@ -8653,6 +8653,25 @@ extern "C" int ds4_gpu_attention_decode_heads_glm_tensor(
     return 0;
 }
 
+/* GLM-5.2 sigmoid router selection runs on the Metal backend only; this stub
+ * keeps the CUDA build linking (GLM on CUDA is unsupported and untested). */
+extern "C" int ds4_gpu_router_select_glm_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        const ds4_gpu_tensor *logits) {
+    (void)selected; (void)weights; (void)probs; (void)model_map; (void)model_size;
+    (void)bias_offset; (void)n_expert; (void)n_expert_used; (void)expert_weight_scale; (void)logits;
+    fprintf(stderr, "ds4: GLM router select is not supported on the CUDA backend\n");
+    return 0;
+}
+
 extern "C" int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
