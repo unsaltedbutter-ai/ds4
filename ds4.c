@@ -4357,6 +4357,7 @@ static void model_map_span_vec_include_layer(ds4_model_map_span_vec *spans, cons
     DS4_INCLUDE_TENSOR(l->attn_sinks);
     DS4_INCLUDE_TENSOR(l->attn_output_a);
     DS4_INCLUDE_TENSOR(l->attn_output_b);
+    DS4_INCLUDE_TENSOR(l->attn_output);     /* GLM plain o_proj (NULL for DeepSeek's _a/_b) */
     DS4_INCLUDE_TENSOR(l->attn_compressor_ape);
     DS4_INCLUDE_TENSOR(l->attn_compressor_kv);
     DS4_INCLUDE_TENSOR(l->attn_compressor_gate);
@@ -4380,6 +4381,9 @@ static void model_map_span_vec_include_layer(ds4_model_map_span_vec *spans, cons
     DS4_INCLUDE_TENSOR(l->ffn_gate_shexp);
     DS4_INCLUDE_TENSOR(l->ffn_up_shexp);
     DS4_INCLUDE_TENSOR(l->ffn_down_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_dense);  /* GLM dense FFN il<3 (NULL otherwise) */
+    DS4_INCLUDE_TENSOR(l->ffn_up_dense);
+    DS4_INCLUDE_TENSOR(l->ffn_down_dense);
 #undef DS4_INCLUDE_TENSOR
 }
 
@@ -4397,6 +4401,7 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
     DS4_INCLUDE_TENSOR(l->attn_sinks);
     DS4_INCLUDE_TENSOR(l->attn_output_a);
     DS4_INCLUDE_TENSOR(l->attn_output_b);
+    DS4_INCLUDE_TENSOR(l->attn_output);     /* GLM plain o_proj (NULL for DeepSeek's _a/_b) */
     DS4_INCLUDE_TENSOR(l->attn_compressor_ape);
     DS4_INCLUDE_TENSOR(l->attn_compressor_kv);
     DS4_INCLUDE_TENSOR(l->attn_compressor_gate);
@@ -4417,6 +4422,9 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
     DS4_INCLUDE_TENSOR(l->ffn_gate_shexp);
     DS4_INCLUDE_TENSOR(l->ffn_up_shexp);
     DS4_INCLUDE_TENSOR(l->ffn_down_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_dense);  /* GLM dense FFN il<3 (NULL otherwise) */
+    DS4_INCLUDE_TENSOR(l->ffn_up_dense);
+    DS4_INCLUDE_TENSOR(l->ffn_down_dense);
 #undef DS4_INCLUDE_TENSOR
 }
 
@@ -4435,7 +4443,12 @@ static void model_map_span_vec_include_layer_decode(
         uint32_t                il) {
     const ds4_layer_weights *l = &w->layer[il];
     model_map_span_vec_include_layer_decode_static(spans, l);
-    if (!weights_streaming_layer_experts_uniform(w, il)) {
+    /* GLM reads its routed experts via ds4_gpu_routed_moe_one_tensor over the
+     * model map and does not use the DeepSeek streaming expert cache, so the
+     * expert tensors must be mapped (paged on access).  NULL for GLM dense
+     * layers, so include_one skips them there. */
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM ||
+        !weights_streaming_layer_experts_uniform(w, il)) {
         model_map_span_vec_include_one(spans, l->ffn_gate_exps);
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
         model_map_span_vec_include_one(spans, l->ffn_down_exps);
