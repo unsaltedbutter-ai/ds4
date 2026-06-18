@@ -293,8 +293,8 @@ Legend: [x] done · [~] partial · [ ] not started.
 ### Phase 3 — Metal + multi-token + server ← **WE ARE HERE**
 - [x] **Metal single-token decode graph (HC=1) — VALIDATED vs CPU** (2026-06-17): `--metal-graph-full-test` gpu_top==cpu_top==154822, logits rms-diff ~0.01. On GPU: HC bypass, 576/512 absorbed attention (no sinks, kq 1/√256, plain o_proj, partial kv_a_norm, no inverse-rope), dense FFN <3, shared expert, output head. Kernel: `kernel_flash_attn_ext_vec_f16_dk576_dv512` (NE=2).
 - [x] **8-expert Metal routed MoE — VALIDATED vs CPU** (2026-06-17): routed experts (≈97% FLOPs) now run on the GPU. The baseline id-based MoE path turned out to be already n_expert-general (per-`(expert,token)` dispatch; `ds4_gpu_encode_moe_sum_experts` reduces any count via a binary add chain) — **no `sum8` kernel was needed**; the only 6-hardwiring was the `n_expert > 6` guard, now `> DS4_GPU_MAX_EXPERT_USED`. GLM decode layer selects on the CPU (`metal_graph_glm_cpu_router`, sigmoid noaux_tc top-8 -> `g->router_selected/weights`) and runs experts on Metal via `ds4_gpu_routed_moe_one_tensor`. `--metal-graph-full-test` on Q2: gpu_top==cpu_top==154822, logits rms-diff 0.0136. `DS4_GLM_CPU_ROUTED_MOE=1` forces the v1 all-CPU path (A/B fallback). DeepSeek 6-expert fast paths bit-identical.
-- [ ] **Multi-token generation:** CPU batch/decode + KV-cache full-attention (`n_swa=0`); the Metal prefill/batch path (`metal_graph_encode_layer_batch`); §7b. Decode-path single-token is done; prefill is not GLM-adapted.
-- [ ] Tokenizer + chat template (`[gMASK]<sop>` framing, reasoning-effort) + multi-EOS + `<tool_call>` render/parse (server-facing; §1b)
+- [~] **Multi-token generation:** full-attention KV (`n_swa=0`) + sequential-decode prefill + multi-EOS landed; `--temp 0` reaches the decode loop end-to-end (~8.8 tok/s) but output is **garbage — GLM multi-row attention (`n_raw>1`/pos>0) is broken** (single-token was the only validated case; see §6). Needs a 2-token GPU-vs-CPU isolation to fix. The default (temp>0) session/batch prefill path SIGSEGVs for GLM (Metal batch prefill not adapted — later item).
+- [~] Tokenizer + chat template: `[gMASK]<sop>` framing + reasoning-effort + `<|assistant|><think>` gen prompt + multi-EOS stop set **done and ID-verified vs the real tokenizer**; `<tool_call>` render/parse + the multi-turn server chat builders (`ds4_chat_*`, `ds4_server.c`) still pending (§1b)
 - [ ] 🔴 Server answers a real prompt end to end + measure tokens/sec on notible
 
 ### Phase 4 — Quant builds & streaming — ✅ mostly DONE
@@ -546,6 +546,36 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (**multi-token generation + GLM chat I/O implemented; blocked on a multi-row attention
+  bug**): Landed three things toward usable generation. (1) **GLM chat I/O** (commit cherry-picked from
+  a parallel subagent): `encode_chat_prompt` now emits the real GLM frame `[gMASK]<sop>` + optional
+  `<|system|>Reasoning Effort: High|Max` + `<|user|>` + prompt + `<|assistant|><think>` (NO newline
+  before `<think>` -- corrects plan 1b); vocab gained `sop_id`/`system_id`/`observation_id`;
+  `special_token_at` has a GLM variant; `ds4_token_is_stop` + the generation loop stop on GLM's three
+  EOS (`<|endoftext|>`=154820, `<|user|>`=154827, `<|observation|>`=154829). **All special-token IDs +
+  the stop set were verified against the real `tokenizer.json`/`generation_config.json` on notible.**
+  (2) **Multi-token KV**: GLM is full-attention (`n_swa=0`); `metal_graph_raw_span_for_batch` returned
+  `n_raw=1` and `metal_graph_raw_cap_for_context` sized the ring to the (zero) SWA window, so only
+  single-token forwards worked. Added GLM branches: full-attention span `n_raw=min(last_pos+1,raw_cap)`
+  and `raw_cap=full ctx` (capped 8192 for memory). (3) **Generation driver**: `generate_metal_graph_raw_swa`
+  prefills GLM by **sequential decode** (loops the validated single-token forward while the KV
+  accumulates) since the Metal batch prefill is not GLM-adapted. Plus `DS4_IGNORE_EOS` debug gate.
+  **STATUS: generation runs end to end** (`ds4 -m glm-5.2-q2.gguf -p "..." --temp 0 -c 2048`,
+  ~8.8 tok/s, reaches the decode loop) **but the output is GARBAGE** (`\n\n`, repeated `<|endoftext|>`,
+  stray CJK). **Root cause: the GLM multi-row attention (`n_raw>1`, i.e. ANY pos>0) is wrong; the
+  single-token path (`n_raw=1`, pos 0, softmax weight 1.0) was the only thing ever validated** -- the
+  §7c-flagged risk. Step-0 (last-prefill, multi-row) logits already show garbage byte-tokens mixed in;
+  decode degrades fully. **Ruled out by code review this session** (all read as correct): `freq_base`
+  (8e6, plumbed consistently to CPU+GPU), the interleaved rope kernel math, the `dk576_dv512` vec
+  attention kernel (DK/DV/NE=2 score+softmax+value reductions), the pad kernel (n_raw<32 single partial
+  block), the KV cache row layout, and `raw_start=0` (no ring for full attn). The bug is subtle and
+  needs an **empirical 2-token GPU-vs-CPU per-layer isolation** (extend `metal_graph_first_token_full_test`
+  to pos 1 with KV accumulation on both sides) to pinpoint rope(pos>0) vs attention(n_raw>1) vs
+  KV-store. **Separately:** the default CLI path (temp>0) routes through the session/batch prefill
+  (`metal_graph_prefill_layer_major`) which SIGSEGVs for GLM (not adapted) -- the `--temp 0` argmax
+  driver is the working multi-token path; a GLM Metal batch-prefill is a later item (like the GPU
+  router). Commits on `ds4-glm`: full-attn KV + sequential prefill; chat framing + multi-EOS; stop-check
+  refactor + DS4_IGNORE_EOS. `make ds4` clean throughout; DeepSeek path untouched (all variant-gated).
 - 2026-06-17 (**8-expert Metal routed MoE VALIDATED vs CPU — routed experts now on the GPU**): The
   routed MoE (≈97% of FLOPs) was the #1 speed item; it ran on the CPU because
   `ds4_gpu_routed_moe_one_tensor` rejected `n_expert > 6` and GLM routes 8. **The fix was far smaller
