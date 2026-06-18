@@ -101,6 +101,9 @@ static id<MTLComputePipelineState> g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipel
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_q4_k_sum6_pipeline;
+/* GLM 8-expert streaming dispatch (optional; nil if the kernels fail to build). */
+static id<MTLComputePipelineState> g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_slots8_q4_k_sum8_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline;
@@ -5613,6 +5616,34 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        /* GLM 8-expert streaming kernels.  Optional and non-fatal: if they fail to
+         * build, leave the pipelines nil and the GLM streaming MoE falls back to
+         * the CPU routed path, so Q2/DeepSeek init is never affected. */
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_slots8_q4_K_pair_swiglu_f32"
+                           constantValues:moe_mv_id_constants
+                                    error:&error];
+        if (fn) {
+            g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline =
+                [g_device newComputePipelineStateWithFunction:fn error:&error];
+        }
+        if (!g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline) {
+            fprintf(stderr, "ds4: Metal slots8 pair_swiglu unavailable (GLM Q4 streaming): %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "function not found");
+        }
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_slots8_q4_K_sum8_f32"
+                           constantValues:moe_mv_id_constants
+                                    error:&error];
+        if (fn) {
+            g_moe_mul_mv_slots8_q4_k_sum8_pipeline =
+                [g_device newComputePipelineStateWithFunction:fn error:&error];
+        }
+        if (!g_moe_mul_mv_slots8_q4_k_sum8_pipeline) {
+            fprintf(stderr, "ds4: Metal slots8 sum8 unavailable (GLM Q4 streaming): %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "function not found");
+        }
+
         error = nil;
         fn = [library newFunctionWithName:@"kernel_q4_gather_slots6"];
         if (!fn) {
@@ -6760,6 +6791,8 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_slots6_q2_k_sum6_pipeline = nil;
         g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_slots6_q4_k_sum6_pipeline = nil;
+        g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline = nil;
+        g_moe_mul_mv_slots8_q4_k_sum8_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_addr_q2_k_sum6_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline = nil;
@@ -20996,6 +21029,109 @@ static int ds4_gpu_encode_mul_mv_slots6_sum6(
     }
     [enc setBuffer:src1 offset:src1_off atIndex:7];
     [enc setBuffer:dst  offset:dst_off  atIndex:8];
+    if (threadgroup_bytes != 0) {
+        [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* GLM 8-expert variants of the slots6 encoders.  Identical wiring, widened to 8
+ * gate/up/down buffers with nei0==8.  Used by the GLM SSD-streaming MoE (wired in
+ * a following commit; marked unused until then). */
+static int __attribute__((unused)) ds4_gpu_encode_mul_mv_slots8_pair_swiglu(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
+        __unsafe_unretained id<MTLBuffer> src0_a[8],
+        const NSUInteger            src0_a_off[8],
+        __unsafe_unretained id<MTLBuffer> src0_b[8],
+        const NSUInteger            src0_b_off[8],
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst_a,
+        NSUInteger                  dst_a_off,
+        id<MTLBuffer>               dst_b,
+        NSUInteger                  dst_b_off,
+        id<MTLBuffer>               dst_mid,
+        NSUInteger                  dst_mid_off,
+        id<MTLBuffer>               weights,
+        NSUInteger                  weights_off,
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  nsg,
+        bool                        rows_per_group_is_nr0) {
+    if (!cb || !pipeline || !args || !act || !src0_a || !src0_a_off || !src0_b || !src0_b_off ||
+        !src1 || !dst_a || !dst_b || !dst_mid || !weights ||
+        args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 8 || args->nei1 <= 0) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!src0_a[i] || !src0_b[i]) return 0;
+    }
+
+    const NSUInteger nr0 = (NSUInteger)args->nr0;
+    const NSUInteger rows_per_group = rows_per_group_is_nr0 ? nr0 : nr0 * nsg;
+    const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
+    const NSUInteger pairs = (NSUInteger)args->nei0 * (NSUInteger)args->nei1;
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBytes:act  length:sizeof(*act)  atIndex:1];
+    for (uint32_t i = 0; i < 8; i++) {
+        [enc setBuffer:src0_a[i] offset:src0_a_off[i] atIndex:2 + i];
+    }
+    for (uint32_t i = 0; i < 8; i++) {
+        [enc setBuffer:src0_b[i] offset:src0_b_off[i] atIndex:10 + i];
+    }
+    [enc setBuffer:src1    offset:src1_off    atIndex:18];
+    [enc setBuffer:dst_a   offset:dst_a_off   atIndex:19];
+    [enc setBuffer:dst_b   offset:dst_b_off   atIndex:20];
+    [enc setBuffer:dst_mid offset:dst_mid_off atIndex:21];
+    [enc setBuffer:weights offset:weights_off atIndex:22];
+    if (threadgroup_bytes != 0) {
+        [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+static int __attribute__((unused)) ds4_gpu_encode_mul_mv_slots8_sum8(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        __unsafe_unretained id<MTLBuffer> src0[8],
+        const NSUInteger            src0_off[8],
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst,
+        NSUInteger                  dst_off,
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  nsg) {
+    if (!cb || !pipeline || !args || !src0 || !src0_off || !src1 || !dst ||
+        args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 8 || args->nei1 <= 0) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!src0[i]) return 0;
+    }
+
+    const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
+    const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    for (uint32_t i = 0; i < 8; i++) {
+        [enc setBuffer:src0[i] offset:src0_off[i] atIndex:1 + i];
+    }
+    [enc setBuffer:src1 offset:src1_off atIndex:9];
+    [enc setBuffer:dst  offset:dst_off  atIndex:10];
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
