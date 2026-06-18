@@ -17,7 +17,7 @@ The deep design notes, geometry map, risk register, and a dated status log live 
 | GLM chat framing, reasoning effort, multi-EOS, `<tool_call>` render/parse | **works** |
 | GPU sigmoid router (no per-MoE-layer CPU sync) | **works**, validated vs the CPU forward |
 | CPU reference forward (all 78 layers) | **works** (debug/reference only) |
-| Q4 GGUF inference | **work in progress** — Q4 (≈409 GiB) is streaming-only on 256 GB and GLM routed-expert streaming is not finished yet |
+| Q4 GGUF inference | **runs, slowly** — Q4 (≈409 GiB) streams on 256 GB via the CPU routed-MoE path (validation-only, ~0.3 tok/s); a fast GPU expert cache is still WIP. Q4 confirms Q2's degeneration on hard prompts is just the 2-bit ceiling, not a bug |
 | DSA indexer (long context), MTP draft tokens | not wired for GLM yet (dense MLA attention is a correct superset) |
 
 GLM-5.2 vs DeepSeek-V4 Flash, the load-bearing deltas (all in the engine, variant-gated):
@@ -83,6 +83,11 @@ The engine auto-detects the GLM variant from the GGUF metadata.
 
 # Interactive chat REPL:
 ./ds4 -m glm-5.2-q2.gguf -c 4096
+
+# Q4, for validation only — runs via the CPU routed-MoE path streaming experts
+# from the demand-paged mmap (≈0.3 tok/s; a fast GPU expert cache is WIP):
+DS4_GLM_CPU_ROUTED_MOE=1 ./ds4 -m glm-5.2-q4.gguf --ssd-streaming --ssd-streaming-cold \
+  --ssd-streaming-cache-experts 1GB -p "..." -n 80 --temp 0 -c 2048
 ```
 
 **Sampling defaults.** GLM's nominal config is temp 1.0 / top_p 0.95, but on the 2-bit Q2
