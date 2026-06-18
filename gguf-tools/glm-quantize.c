@@ -767,38 +767,92 @@ static float *produce_o_absorb(stdb *db, int L) {
     return out;
 }
 
+/* ===== optional real activation imatrix (llama.cpp legacy .dat) =====
+ * Produced by `ds4 --imatrix-dataset ... --imatrix-out ...`: one entry per routed
+ * expert tensor (blk.N.ffn_{gate,up,down}_exps.weight), each packing n_expert
+ * per-expert importance vectors.  With --imatrix, the real per-expert activation
+ * importance replaces the synthetic per-column weight energy for the routed
+ * experts (the headline Q2-quality lever; see README_GLM_Q2.md option A).  Only
+ * ~234 entries (78 layers x 3), so a linear lookup is fine. */
+typedef struct { char *name; float *values; int64_t n_values; } imat_entry;
+static struct { imat_entry *e; int n; } g_imatrix = { NULL, 0 };
+
+static int32_t imat_r_i32(FILE *f) { int32_t v; if (fread(&v, 4, 1, f) != 1) die("imatrix: short read"); return v; }
+
+static void imatrix_load(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) die("imatrix: cannot open file");
+    int32_t n = imat_r_i32(f);
+    if (n < 1) die("imatrix: no entries");
+    g_imatrix.e = xcalloc((size_t)n, sizeof(g_imatrix.e[0]));
+    g_imatrix.n = n;
+    for (int i = 0; i < n; i++) {
+        int32_t len = imat_r_i32(f);
+        if (len < 1 || len > 4096) die("imatrix: bad name length");
+        char *name = xmalloc((size_t)len + 1);
+        if (fread(name, 1, (size_t)len, f) != (size_t)len) die("imatrix: short name read");
+        name[len] = '\0';
+        int32_t ncall = imat_r_i32(f);
+        int32_t nval = imat_r_i32(f);
+        if (nval < 1) die("imatrix: bad value count");
+        float *vals = xmalloc((size_t)nval * sizeof(float));
+        if (fread(vals, sizeof(float), (size_t)nval, f) != (size_t)nval) die("imatrix: short values read");
+        if (ncall > 0) for (int32_t j = 0; j < nval; j++) vals[j] /= (float)ncall;
+        g_imatrix.e[i] = (imat_entry){ name, vals, nval };
+    }
+    fclose(f);
+    fprintf(stderr, "glm-quantize: loaded imatrix %s (%d entries)\n", path, n);
+}
+
+/* Per-expert importance vector for `name`/`expert` of width ncols, or NULL if the
+ * imatrix has no entry for that tensor.  Handles the packed [n_expert*ncols] layout. */
+static const float *imatrix_lookup(const char *name, int expert, int64_t ncols, int n_expert) {
+    for (int i = 0; i < g_imatrix.n; i++) {
+        if (strcmp(g_imatrix.e[i].name, name) != 0) continue;
+        const imat_entry *e = &g_imatrix.e[i];
+        if (e->n_values == ncols) return e->values;
+        if (expert >= 0 && e->n_values == ncols * (int64_t)n_expert)
+            return e->values + (size_t)expert * (size_t)ncols;
+        die("imatrix: size mismatch for entry");
+    }
+    return NULL;
+}
+
 /* Per-expert quantization (parallel across the 256 experts of a MoE tensor). */
-typedef struct { stdb *db; const char *tmpl; ds4q_type type; int64_t per_rows, ncols; size_t row_bytes; uint8_t *out; } exp_ctx;
+typedef struct { stdb *db; const char *tmpl; const char *gguf_name; ds4q_type type; int64_t per_rows, ncols; int n_expert; size_t row_bytes; uint8_t *out; } exp_ctx;
 static void exp_range(int e0, int e1, void *c) {
     const exp_ctx *x = c;
-    /* Compute the synthetic per-column importance for every expert quant that can use
-     * it: IQ2_XXS REQUIRES it, and Q2_K/Q4_K use it when present.  Previously only the
-     * imatrix-requiring gate/up (IQ2_XXS) got it, so the Q2_K down_proj was quantized
-     * unweighted (NULL imatrix -> ds4q_write_q2_k_block_ref).  Feeding down the same
-     * weight-energy importance is the A0 experiment (see README_GLM_Q2.md). */
-    const bool need_imat = ds4q_requires_imatrix(x->type) ||
-                           x->type == DS4Q_TYPE_Q2_K ||
-                           x->type == DS4Q_TYPE_Q4_K;
-    float *imat = need_imat ? xmalloc((size_t)x->ncols * sizeof(float)) : NULL;
+    /* The synthetic per-column weight energy is the fallback used when no real
+     * imatrix is loaded, for any expert quant that can use importance: IQ2_XXS
+     * REQUIRES it, and Q2_K/Q4_K use it when present.  (Previously only IQ2_XXS
+     * gate/up got it and the Q2_K down_proj was quantized unweighted.)  With
+     * --imatrix the real per-expert activation importance is used instead. */
+    const bool can_weight = ds4q_requires_imatrix(x->type) ||
+                            x->type == DS4Q_TYPE_Q2_K ||
+                            x->type == DS4Q_TYPE_Q4_K;
+    float *synth = can_weight ? xmalloc((size_t)x->ncols * sizeof(float)) : NULL;
     for (int E = e0; E < e1; E++) {
         char nm[256]; snprintf(nm, sizeof(nm), x->tmpl, E);
         const gtensor *g = stdb_find(x->db, nm);
         if (!g) { fprintf(stderr, "glm-quantize: missing %s\n", nm); exit(1); }
         int64_t ne = 0; float *src = stdb_read_f32(x->db, g, &ne);
         if (ne != x->per_rows * x->ncols) { fprintf(stderr, "glm-quantize: %s size mismatch\n", nm); exit(1); }
-        if (need_imat) {
-            /* synthetic importance = per-column weight energy (no real imatrix yet) */
-            for (int64_t cc = 0; cc < x->ncols; cc++) imat[cc] = 0.0f;
+        const float *imat = NULL;
+        if (g_imatrix.n > 0) imat = imatrix_lookup(x->gguf_name, E, x->ncols, x->n_expert);
+        if (!imat && can_weight) {
+            /* synthetic importance = per-column weight energy (no real imatrix) */
+            for (int64_t cc = 0; cc < x->ncols; cc++) synth[cc] = 0.0f;
             for (int64_t r = 0; r < x->per_rows; r++) {
                 const float *row = src + (size_t)r * x->ncols;
-                for (int64_t cc = 0; cc < x->ncols; cc++) imat[cc] += row[cc] * row[cc];
+                for (int64_t cc = 0; cc < x->ncols; cc++) synth[cc] += row[cc] * row[cc];
             }
+            imat = synth;
         }
         ds4q_quantize_chunk(x->type, src, x->out + (size_t)E * x->per_rows * x->row_bytes,
                             0, x->per_rows, x->ncols, imat);
         free(src);
     }
-    free(imat);
+    free(synth);
 }
 
 /* Routed-expert quant types: default Q4_K; --q2 sets IQ2_XXS gate/up + Q2_K down.
@@ -908,7 +962,7 @@ static void write_gguf_full(const char *out, const char *hf_dir, int n_layers) {
             size_t rs = ds4q_row_size(t->type, ncols);
             size_t total = (size_t)t->ne[2] * (size_t)per_rows * rs;
             uint8_t *out = xmalloc(total);
-            exp_ctx ctx = { &db, t->hf, t->type, per_rows, ncols, rs, out };
+            exp_ctx ctx = { &db, t->hf, t->name, t->type, per_rows, ncols, (int)t->ne[2], rs, out };
             parallel_for((int)t->ne[2], exp_range, &ctx);
             fwrite(out, 1, total, f); dpos += total; free(out);
         } else {
@@ -1108,6 +1162,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--q2") == 0) { g_exp_gu_type = DS4Q_TYPE_IQ2_XXS; g_exp_down_type = DS4Q_TYPE_Q2_K; }
         else if (strcmp(argv[i], "--gu-type") == 0 && i + 1 < argc) g_exp_gu_type = parse_qtype(argv[++i]);
         else if (strcmp(argv[i], "--down-type") == 0 && i + 1 < argc) g_exp_down_type = parse_qtype(argv[++i]);
+        else if (strcmp(argv[i], "--imatrix") == 0 && i + 1 < argc) imatrix_load(argv[++i]);
         else if (strcmp(argv[i], "--verify") == 0 && i + 1 < argc) verify_in = argv[++i];
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) usage();
