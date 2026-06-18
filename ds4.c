@@ -67,6 +67,14 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
     "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
+/* GLM-5.2 reasoning-effort directives. Emitted inside a <|system|> block at the
+ * head of the prompt when thinking is on (chat_template.jinja: "<|system|>Reasoning
+ * Effort: {{ effective_reasoning_effort | capitalize }}", default "max"). The text
+ * carries no trailing newline (the template strips it). DS4_THINK_HIGH -> "High",
+ * DS4_THINK_MAX -> "Max". */
+static const char DS4_GLM_REASONING_EFFORT_HIGH[] = "Reasoning Effort: High";
+static const char DS4_GLM_REASONING_EFFORT_MAX[]  = "Reasoning Effort: Max";
+
 /* DeepSeek recommends Think Max only with at least a 384K-token context window.
  * Below that size we keep ordinary thinking to avoid injecting a prompt that
  * asks for a reasoning budget the allocated context is not meant to hold. */
@@ -22307,6 +22315,9 @@ struct ds4_vocab {
     int think_start_id;
     int think_end_id;
     int dsml_id;
+    int sop_id;         /* GLM <sop> (start-of-prompt); -1 for DeepSeek. */
+    int system_id;      /* GLM <|system|>; -1 for DeepSeek. */
+    int observation_id; /* GLM <|observation|> (tool results; also an EOS stop); -1 for DeepSeek. */
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -22784,6 +22795,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->think_start_id = vocab_lookup_optional(vocab, "<think>");
         vocab->think_end_id   = vocab_lookup_optional(vocab, "</think>");
         vocab->dsml_id        = -1;
+        vocab->sop_id         = vocab_lookup_optional(vocab, "<sop>");
+        vocab->system_id      = vocab_lookup_optional(vocab, "<|system|>");
+        vocab->observation_id = vocab_lookup_optional(vocab, "<|observation|>");
     } else {
         vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
         vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
@@ -22792,6 +22806,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->think_start_id = vocab_lookup(vocab, "<think>");
         vocab->think_end_id = vocab_lookup(vocab, "</think>");
         vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+        vocab->sop_id = -1;
+        vocab->system_id = -1;
+        vocab->observation_id = -1;
     }
 }
 
@@ -22811,6 +22828,36 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM-5.2 chat framing (chat_template.jinja, verified against the real
+         * template): [gMASK]<sop>, then a reasoning-effort <|system|> block when
+         * thinking is on, then any user system text in its own <|system|> block,
+         * then <|user|> + prompt, then the assistant generation prompt
+         * <|assistant|> followed immediately (no newline) by <think> (thinking on)
+         * or <think></think> (thinking off). */
+        token_vec_push(out, vocab->bos_id);   /* [gMASK] */
+        token_vec_push(out, vocab->sop_id);   /* <sop>   */
+        if (ds4_think_mode_enabled(think_mode)) {
+            token_vec_push(out, vocab->system_id);
+            bpe_tokenize_text(vocab,
+                              think_mode == DS4_THINK_HIGH ?
+                                  DS4_GLM_REASONING_EFFORT_HIGH :
+                                  DS4_GLM_REASONING_EFFORT_MAX,
+                              out);
+        }
+        if (system && system[0]) {
+            token_vec_push(out, vocab->system_id);
+            bpe_tokenize_text(vocab, system, out);
+        }
+        token_vec_push(out, vocab->user_id);
+        bpe_tokenize_text(vocab, prompt, out);
+        token_vec_push(out, vocab->assistant_id);
+        token_vec_push(out, vocab->think_start_id);
+        if (!ds4_think_mode_enabled(think_mode)) {
+            token_vec_push(out, vocab->think_end_id);  /* <think></think> */
+        }
+        return;
+    }
     token_vec_push(out, vocab->bos_id);
     if (think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
@@ -22836,7 +22883,17 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
     struct special {
         const char *text;
         int token;
-    } specials[] = {
+    } glm_specials[] = {
+        {"[gMASK]",          vocab->bos_id},
+        {"<sop>",            vocab->sop_id},
+        {"<|system|>",       vocab->system_id},
+        {"<|assistant|>",    vocab->assistant_id},
+        {"<|user|>",         vocab->user_id},
+        {"<|observation|>",  vocab->observation_id},
+        {"</think>",         vocab->think_end_id},
+        {"<think>",          vocab->think_start_id},
+    };
+    struct special ds_specials[] = {
         {"<｜begin▁of▁sentence｜>", vocab->bos_id},
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"<｜User｜>",              vocab->user_id},
@@ -22846,7 +22903,14 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"｜DSML｜",                vocab->dsml_id},
     };
 
-    for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
+    const struct special *specials =
+        (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) ? glm_specials : ds_specials;
+    size_t count = (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) ?
+        sizeof(glm_specials) / sizeof(glm_specials[0]) :
+        sizeof(ds_specials) / sizeof(ds_specials[0]);
+
+    for (size_t i = 0; i < count; i++) {
+        if (specials[i].token < 0) continue;
         size_t n = strlen(specials[i].text);
         if (!strncmp(p, specials[i].text, n)) {
             *token = specials[i].token;
@@ -23067,6 +23131,19 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
+}
+
+/* True if `token` ends generation. DeepSeek has a single EOS; GLM-5.2's
+ * generation_config gives eos_token_id = [<|endoftext|>, <|user|>, <|observation|>]
+ * (154820 / 154827 / 154829), so any of the three halts a GLM turn. */
+bool ds4_token_is_stop(ds4_engine *e, int token) {
+    const ds4_vocab *v = &e->vocab;
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        return (v->eos_id >= 0 && token == v->eos_id) ||
+               (v->user_id >= 0 && token == v->user_id) ||
+               (v->observation_id >= 0 && token == v->observation_id);
+    }
+    return token == v->eos_id;
 }
 
 int ds4_token_user(ds4_engine *e) {
