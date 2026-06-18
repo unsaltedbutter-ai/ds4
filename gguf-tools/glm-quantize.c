@@ -771,7 +771,14 @@ static float *produce_o_absorb(stdb *db, int L) {
 typedef struct { stdb *db; const char *tmpl; ds4q_type type; int64_t per_rows, ncols; size_t row_bytes; uint8_t *out; } exp_ctx;
 static void exp_range(int e0, int e1, void *c) {
     const exp_ctx *x = c;
-    const bool need_imat = ds4q_requires_imatrix(x->type);
+    /* Compute the synthetic per-column importance for every expert quant that can use
+     * it: IQ2_XXS REQUIRES it, and Q2_K/Q4_K use it when present.  Previously only the
+     * imatrix-requiring gate/up (IQ2_XXS) got it, so the Q2_K down_proj was quantized
+     * unweighted (NULL imatrix -> ds4q_write_q2_k_block_ref).  Feeding down the same
+     * weight-energy importance is the A0 experiment (see README_GLM_Q2.md). */
+    const bool need_imat = ds4q_requires_imatrix(x->type) ||
+                           x->type == DS4Q_TYPE_Q2_K ||
+                           x->type == DS4Q_TYPE_Q4_K;
     float *imat = need_imat ? xmalloc((size_t)x->ncols * sizeof(float)) : NULL;
     for (int E = e0; E < e1; E++) {
         char nm[256]; snprintf(nm, sizeof(nm), x->tmpl, E);
