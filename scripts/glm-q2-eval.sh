@@ -44,6 +44,11 @@ echo "=== perplexity @ $(date) ===" >>"$OUT/run.log"
 echo "  $(grep -E 'ppl=' "$OUT/ppl.out" 2>/dev/null | tail -1)" >>"$OUT/run.log"
 
 # --- 2. battery: greedy is the deterministic signal; one sampled long run too ---
+# Set PPLONLY=1 to skip the battery (fast iteration: perplexity is the primary metric).
+if [ "${PPLONLY:-0}" = "1" ]; then
+    echo "PPLONLY=1, skipping battery" >>"$OUT/run.log"
+    echo "all done $(date)" >>"$OUT/run.log"; echo DONE >"$OUT/DONE"; exit 0
+fi
 SHORT="List the first five planets from the Sun."
 LONG="List the first five planets from the Sun and give one interesting fact about each one."
 gen() { # name prompt nmax temp topp

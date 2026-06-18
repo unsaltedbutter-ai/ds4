@@ -790,7 +790,20 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
 static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     char *text = read_prompt_file(cfg->gen.perplexity_file_path, true);
     ds4_tokens tokens = {0};
-    ds4_tokenize_text(engine, text, &tokens);
+    /* GLM is full-attention and is always primed with [gMASK]<sop>; scoring raw
+     * text with no BOS leaves position 0 out of distribution, and because every
+     * later position attends to it, perplexity explodes (avg_nll ~8.7 vs a sane
+     * few).  Prepend the GLM BOS frame, then the text.  DeepSeek keeps the plain
+     * tokenization (bit-identical). */
+    if (ds4_is_glm()) {
+        ds4_chat_begin(engine, &tokens);
+        ds4_tokens body = {0};
+        ds4_tokenize_text(engine, text, &body);
+        for (int i = 0; i < body.len; i++) ds4_tokens_push(&tokens, body.v[i]);
+        ds4_tokens_free(&body);
+    } else {
+        ds4_tokenize_text(engine, text, &tokens);
+    }
     free(text);
 
     /* Seed the graph with enough real context to stay on the normal Metal
