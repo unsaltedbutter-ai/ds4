@@ -1635,6 +1635,12 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    for (int ai = 1; ai < argc; ai++) {
+        if (!strcmp(argv[ai], "--glm-attn-test")) {
+            ds4_glm_attention_unit_test();
+            return 0;
+        }
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

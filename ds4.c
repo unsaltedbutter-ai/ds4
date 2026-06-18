@@ -15302,6 +15302,87 @@ static bool metal_graph_encode_decode_layer_glm(
     return ok;
 }
 
+/* Standalone unit test for the GLM absorbed-MLA flash attention
+ * (ds4_gpu_attention_decode_heads_glm_tensor).  Needs no model: feeds random
+ * q [n_head x 576] and a raw KV cache [n_raw x 576] and compares the GPU heads
+ * to a plain CPU softmax(q.k / sqrt(256)) . v[:512] reference for several n_raw.
+ * The single-token (n_raw=1) path was validated end to end, but multi-row
+ * (n_raw>1, i.e. any pos>0) was never exercised; this isolates the kernel from
+ * rope / KV-store.  Run with --glm-attn-test from a dir containing metal/. */
+void ds4_glm_attention_unit_test(void) {
+    if (!ds4_gpu_init()) { fprintf(stderr, "ds4: GPU init failed\n"); return; }
+    const uint32_t n_head = 64, key_dim = 576, value_dim = 512, raw_cap = 64;
+    const float kq_scale = 1.0f / sqrtf(256.0f);
+
+    float *q = xmalloc((size_t)n_head * key_dim * sizeof(float));
+    float *kv = xmalloc((size_t)raw_cap * key_dim * sizeof(float));
+    float *gpu_heads = xmalloc((size_t)n_head * value_dim * sizeof(float));
+    float *cpu_heads = xmalloc((size_t)n_head * value_dim * sizeof(float));
+    for (uint32_t i = 0; i < n_head * key_dim; i++) q[i] = sinf(0.1f * (float)i) * 0.5f;
+    for (uint32_t i = 0; i < raw_cap * key_dim; i++) kv[i] = cosf(0.07f * (float)i) * 0.5f;
+
+    ds4_gpu_tensor *q_t = ds4_gpu_tensor_alloc((uint64_t)n_head * key_dim * sizeof(float));
+    ds4_gpu_tensor *kv_t = ds4_gpu_tensor_alloc((uint64_t)raw_cap * key_dim * sizeof(float));
+    ds4_gpu_tensor *heads_t = ds4_gpu_tensor_alloc((uint64_t)n_head * value_dim * sizeof(float));
+    if (!q_t || !kv_t || !heads_t ||
+        !ds4_gpu_tensor_write(q_t, 0, q, (uint64_t)n_head * key_dim * sizeof(float)) ||
+        !ds4_gpu_tensor_write(kv_t, 0, kv, (uint64_t)raw_cap * key_dim * sizeof(float))) {
+        fprintf(stderr, "ds4: GLM attn test buffer setup failed\n");
+        return;
+    }
+
+    const uint32_t cases[] = { 1, 2, 3, 4, 8, 16 };
+    double worst = 0.0;
+    for (int c = 0; c < 6; c++) {
+        const uint32_t n_raw = cases[c];
+        if (ds4_gpu_begin_commands() == 0) { fprintf(stderr, "begin failed\n"); return; }
+        const int ok = ds4_gpu_attention_decode_heads_glm_tensor(heads_t, q_t, kv_t, n_raw,
+                                                                 raw_cap, 0, n_head, key_dim,
+                                                                 value_dim, kq_scale);
+        if (ds4_gpu_end_commands() == 0) { fprintf(stderr, "end failed\n"); return; }
+        if (!ok || !ds4_gpu_tensor_read(heads_t, 0, gpu_heads,
+                                        (uint64_t)n_head * value_dim * sizeof(float))) {
+            fprintf(stderr, "ds4: GLM attn n_raw=%u failed\n", n_raw);
+            continue;
+        }
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + (size_t)h * key_dim;
+            float scores[64];
+            float maxs = -1e30f;
+            for (uint32_t r = 0; r < n_raw; r++) {
+                const float *kr = kv + (size_t)r * key_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < key_dim; d++) dot += qh[d] * kr[d];
+                scores[r] = dot * kq_scale;
+                if (scores[r] > maxs) maxs = scores[r];
+            }
+            float sum = 0.0f;
+            for (uint32_t r = 0; r < n_raw; r++) { scores[r] = expf(scores[r] - maxs); sum += scores[r]; }
+            float *oh = cpu_heads + (size_t)h * value_dim;
+            for (uint32_t d = 0; d < value_dim; d++) {
+                float acc = 0.0f;
+                for (uint32_t r = 0; r < n_raw; r++) acc += scores[r] * kv[(size_t)r * key_dim + d];
+                oh[d] = acc / sum;
+            }
+        }
+        double maxdiff = 0.0, sumsq = 0.0;
+        for (uint32_t i = 0; i < n_head * value_dim; i++) {
+            const double d = fabs((double)gpu_heads[i] - (double)cpu_heads[i]);
+            if (d > maxdiff) maxdiff = d;
+            sumsq += d * d;
+        }
+        if (maxdiff > worst) worst = maxdiff;
+        fprintf(stderr, "ds4: GLM attn n_raw=%2u  max=%.6f rms=%.6f\n",
+                n_raw, maxdiff, sqrt(sumsq / (n_head * value_dim)));
+    }
+    fprintf(stderr, "ds4: GLM attn unit test %s (worst max diff %.6f over n_raw 1..16)\n",
+            worst < 0.01 ? "PASS" : "FAIL", worst);
+    ds4_gpu_tensor_free(q_t);
+    ds4_gpu_tensor_free(kv_t);
+    ds4_gpu_tensor_free(heads_t);
+    free(q); free(kv); free(gpu_heads); free(cpu_heads);
+}
+
 static bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,

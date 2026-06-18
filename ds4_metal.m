@@ -17194,9 +17194,14 @@ static int ds4_gpu_encode_flash_attention_raw_heads_glm(
         .ne01 = 1,
         .ne02 = (int32_t)n_head,
         .ne03 = 1,
-        .nb01 = (uint64_t)n_head * val_row_bytes,
-        .nb02 = val_row_bytes,
-        .nb03 = (uint64_t)n_head * val_row_bytes,
+        /* These are the QUERY strides (kernel: q += iq2*nb02), so they use the
+         * key width (576), not the value width (512).  DeepSeek never hit this
+         * because key==value; for GLM's 576/512 split, val_row_bytes here read
+         * every head>0's query from the wrong offset and corrupted the scores
+         * (invisible at n_raw==1 where softmax weight is 1.0). */
+        .nb01 = (uint64_t)n_head * key_row_bytes,
+        .nb02 = key_row_bytes,
+        .nb03 = (uint64_t)n_head * key_row_bytes,
         .ne11 = (int32_t)n_raw,
         .ne_12_2 = 1,
         .ne_12_3 = 1,
