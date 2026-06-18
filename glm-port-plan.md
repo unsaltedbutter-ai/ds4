@@ -387,9 +387,11 @@ kernel params. Gate everything on `DS4_MODEL_VARIANT == DS4_VARIANT_GLM`.
    → GLM plain matmul `attn_output [64*512=32768 → 6144]` (reuse the Q8 matmul, no grouping).
 4. **Dense FFN (layers <3).** `metal_graph_encode_layer_ffn_batch` → GLM dense layers run a SwiGLU on
    `ffn_{gate,up,down}_dense` (intermediate 12288); skip routed MoE + shared + router for those layers.
-5. **Router scoring.** `g_dsv4_softplus_sqrt_pipeline` computes `sqrt(softplus(x))`; GLM is **sigmoid**
-   (`scoring_func`). Add a sigmoid variant kernel/param; keep the noaux_tc bias (`exp_probs_b`) + flat
-   top-8 (`g_dsv4_router_*`) + normalized weights × 2.5 (already general once `n_expert_used=8`).
+5. **Router scoring — DONE (2026-06-17, GPU; see §6).** Threaded `sigmoid_scoring` into
+   `ds4_gpu_encode_router_select` (`g_unary_sigmoid_pipeline` vs `sqrt(softplus)`); the noaux_tc bias +
+   flat top-8 + normalized × 2.5 are scoring-agnostic. New public `ds4_gpu_router_select_glm_tensor`
+   (+ CUDA stub) selects on the GPU with no per-MoE-layer CPU sync; validated numerically identical to the
+   CPU router (rms 0.01356 both) and lifts generation 8.9 -> 11.6 tok/s.
 6. **Output head.** Skip the Metal HC collapse (`output_hc_fn`); GLM does final RMSNorm(`output_norm`) +
    `output` matmul only.
 7. **Raw-KV path / no compression.** GLM runs `compress_ratio=0` (raw latent KV). Verify the Metal raw-KV
@@ -553,6 +555,22 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (**SPEED: GLM router moved to the GPU — generation 8.9 -> 11.6 tok/s, validated**): The v1 GLM
+  decode path selected experts on the host every MoE layer (`metal_graph_glm_cpu_router`: end the command
+  buffer, read `ffn_norm` back, top-k on the CPU, upload `selected/weights`) -- a GPU<->CPU sync per layer.
+  Threaded a `sigmoid_scoring` flag into the static `ds4_gpu_encode_router_select` (the bias add / flat
+  top-k / weight gather / normalize / x scale are scoring-agnostic, so only the unary op differs:
+  `g_unary_sigmoid_pipeline` vs `sqrt(softplus)`), added a focused public `ds4_gpu_router_select_glm_tensor`
+  (no hash/groups, always noaux_tc bias) encoded into the in-flight command buffer, and wired the GLM decode
+  layer to select on the GPU by default (`DS4_GLM_CPU_ROUTER=1` forces the v1 host router for A/B). DeepSeek's
+  `ds4_gpu_router_select_tensor` signature is untouched (+ CUDA stub for the new GLM entry). **Validated on
+  notible** (`--metal-graph-full-test -p "..."`, server stopped/restarted via the trap script): GPU router vs
+  CPU router give **numerically identical logits** -- both `cpu_top==gpu_top==154822`, logits_rms 0.0135575
+  (GPU) vs 0.0135582 (CPU), differing by 7e-7, reproducing the §6 0.0136 baseline. **Generation 8.88 -> 11.56
+  tok/s, prefill 8.74 -> 11.41** (greedy, glm-5.2-q2.gguf). Greedy *text* diverges from the CPU router (prose
+  vs numbered list) -- both coherent and correct: identical logits to 7 sig-figs, but a near-tied formatting
+  token flips under greedy on Q2 and cascades. Remaining speed item: the GLM Metal **batch** prefill
+  (currently sequential single-token; `metal_graph_encode_layer_batch`).
 - 2026-06-17 (**SERVER FINALE: GLM server answers a prompt end to end on notible; code exonerated vs a
   Q2-quality suspicion**): Implemented the full GLM server chat I/O (all gated on `variant==GLM`, DeepSeek
   bit-identical, 8 no-model unit tests via `./ds4_test --server`): (1) `ds4_server.c`
