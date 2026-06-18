@@ -294,8 +294,8 @@ Legend: [x] done · [~] partial · [ ] not started.
 - [x] **Metal single-token decode graph (HC=1) — VALIDATED vs CPU** (2026-06-17): `--metal-graph-full-test` gpu_top==cpu_top==154822, logits rms-diff ~0.01. On GPU: HC bypass, 576/512 absorbed attention (no sinks, kq 1/√256, plain o_proj, partial kv_a_norm, no inverse-rope), dense FFN <3, shared expert, output head. Kernel: `kernel_flash_attn_ext_vec_f16_dk576_dv512` (NE=2).
 - [x] **8-expert Metal routed MoE — VALIDATED vs CPU** (2026-06-17): routed experts (≈97% FLOPs) now run on the GPU. The baseline id-based MoE path turned out to be already n_expert-general (per-`(expert,token)` dispatch; `ds4_gpu_encode_moe_sum_experts` reduces any count via a binary add chain) — **no `sum8` kernel was needed**; the only 6-hardwiring was the `n_expert > 6` guard, now `> DS4_GPU_MAX_EXPERT_USED`. GLM decode layer selects on the CPU (`metal_graph_glm_cpu_router`, sigmoid noaux_tc top-8 -> `g->router_selected/weights`) and runs experts on Metal via `ds4_gpu_routed_moe_one_tensor`. `--metal-graph-full-test` on Q2: gpu_top==cpu_top==154822, logits rms-diff 0.0136. `DS4_GLM_CPU_ROUTED_MOE=1` forces the v1 all-CPU path (A/B fallback). DeepSeek 6-expert fast paths bit-identical.
 - [x] **Multi-token generation WORKS (greedy + sampled, no crash):** full-attention KV (`n_swa=0`) + sequential-decode prefill (both the standalone argmax driver and the **session** path) + multi-EOS; the multi-row attention Q-stride bug is **fixed** (`--glm-attn-test` exact to n_raw=256) and the session/sampled SIGSEGV (GLM-unadapted Metal batch prefill) is **fixed** (GLM session prefill now sequential). `--temp 0` gives coherent correct text (~8.7 tok/s); sampled needs `--top-p 0.95` (GLM's default; the ds4 default top_p=1.0 does no filtering -> noisy on Q2). Speed follow-ups: GLM Metal **batch** prefill (sequential is O(prompt) single-token evals) and a GPU router to drop the per-MoE-layer sync.
-- [~] Tokenizer + chat template: `[gMASK]<sop>` framing + reasoning-effort + `<|assistant|><think>` gen prompt + multi-EOS stop set **done and ID-verified vs the real tokenizer**; `<tool_call>` render/parse + the multi-turn server chat builders (`ds4_chat_*`, `ds4_server.c`) still pending (§1b)
-- [ ] 🔴 Server answers a real prompt end to end + measure tokens/sec on notible
+- [x] Tokenizer + chat template: `[gMASK]<sop>` framing + reasoning-effort + `<|assistant|><think>` gen prompt + multi-EOS stop set **ID-verified vs the real tokenizer**; **`<tool_call>` render/parse + multi-turn server chat builders (`ds4_chat_*`) + server `render_chat_prompt_text` GLM framing all landed** (gated on `variant==GLM`, DeepSeek bit-identical; 8 no-model unit tests in `./ds4_test --server`)
+- [x] 🔴 **Server answers a real prompt end to end — VALIDATED on notible** (2026-06-17): GLM-Q2 server (`ds4-server -m glm-5.2-q2.gguf -c 2048`) renders the correct GLM frame (`--trace`: `[gMASK]<sop><|system|>Reasoning Effort: High<|user|>...<|assistant|><think>`), answers a prompt **coherently** (temp 0.6/top_p 0.95: correct planet list), at **~7.8 tok/s decode** (prefill ~8.7 t/s). Default sampling now temp 0.6/top_p 0.95 (temp 1.0 degenerates on Q2 — see §6)
 
 ### Phase 4 — Quant builds & streaming — ✅ mostly DONE
 - [x] **Q2 GGUF** (`/Volumes/4TB-1/glm-5.2-q2.gguf`, 218.9 GiB) and **Q4 GGUF** (408.7 GiB) built; both `--inspect`-validated
@@ -553,6 +553,31 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (**SERVER FINALE: GLM server answers a prompt end to end on notible; code exonerated vs a
+  Q2-quality suspicion**): Implemented the full GLM server chat I/O (all gated on `variant==GLM`, DeepSeek
+  bit-identical, 8 no-model unit tests via `./ds4_test --server`): (1) `ds4_server.c`
+  `render_chat_prompt_text` dispatches to a GLM renderer mirroring `chat_template.jinja` — `[gMASK]<sop>`
+  head, reasoning-effort + tool schemas in their own `<|system|>` turns, `<|user|>`/`<|assistant|><think>`
+  turns, `<|observation|><tool_response>` results, no per-turn EOS; (2) GLM `<tool_call>` render
+  (`append_glm_tool_calls_text`) + parse (`parse_generated_message_glm`, recovers arg types by trying each
+  value as JSON) + streaming markers; (3) `ds4.c` token builders `ds4_chat_*` given the same GLM framing
+  (CLI/agent path); (4) a small `ds4_is_glm()` / `ds4_glm_reasoning_effort_text()` seam in `ds4.h`. Fetched
+  the real `chat_template.jinja` from notible to pin the multi-turn semantics (reasoning kept only for the
+  turn after the last user; `<|observation|>` once per consecutive tool run; string args verbatim / others
+  as JSON). **E2E on notible** (prod 8085 stopped via the launchd script, restarted after — done via a
+  trap-protected detached script so prod always comes back): GLM-Q2 server loads (~80s), `--trace` confirms
+  the exact GLM frame is rendered, answers coherently at **~7.8 tok/s** decode / ~8.7 prefill.
+  **Sampling investigation (user flagged temp 1.0 garbage as a possible bug):** at first the server's default
+  (thinking-HIGH, which forces temp 1.0) produced degenerate `</think>`-spam output. Isolated it with the
+  CLI generate path: greedy `--temp 0` is coherent + **byte-identical run-to-run (deterministic)** and
+  reproduces the §6 planet answer; the **long** "list AND give a fact about each" prompt degenerates the SAME
+  way on BOTH the CLI and the server (lists correctly then loops; CLI temp 1.0 even reproduces the "2. Uran"
+  truncation), while the **short** prompt stays coherent on both. So it is **not a code/path bug** (CLI ==
+  server, deterministic, greedy-correct, and §6's `--metal-graph-full-test` already shows Metal == CPU) — it
+  is the **Q2 2-bit quality ceiling** on complex prompts, worse at temp 1.0. **Default GLM sampling changed
+  to temp 0.6 / top_p 0.95** (request default + thinking-mode override + CLI), which keeps Q2 coherent. The
+  one thing still unsettled is whether Q2 itself is miscalibrated vs Q4 — that needs the Q4 comparison, still
+  blocked on unimplemented GLM expert streaming. **Remaining this session:** GPU sigmoid router (speed).
 - 2026-06-17 (**Q4 quality cross-check attempted -> found GLM SSD streaming is unimplemented; output
   glitches are Q2/greedy, not engine bugs**): Tried to run Q4 (408.7 GiB, streaming-only on 256 GB) to
   prove the Q2 generation glitches are quantization, not a code bug. **Q4 streaming is blocked**: the
