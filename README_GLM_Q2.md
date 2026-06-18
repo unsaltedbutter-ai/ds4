@@ -343,6 +343,18 @@ quantitative metric (TBD as candidates land).
 
 ## 5. Campaign log (newest first)
 
+- **2026-06-18 — Option A (real imatrix) built and collecting.** Implemented the full GLM
+  imatrix path: converter `--imatrix` consumes a per-expert `.dat`; the engine collects via
+  GLM **sequential decode** (the batch-prefill collector SIGSEGVs on GLM). First collector
+  read the routed activations with a per-layer GPU read *after* the MoE and crashed at layer
+  ~44 — `ds4_gpu_tensor_read` consumes a Metal command buffer, and ~3 reads/layer exhaust the
+  pool. Fix: collect **gate/up importance inside the CPU router** (where ffn_norm is already
+  read back, one sync/layer — the validated path), and skip the down_proj (its input only
+  exists on the GPU post-MoE); the converter falls back to synthetic importance for down.
+  Smoke test clean (134 tok, 80400 routed observations, valid 900M `.dat`). A0 (synthetic
+  down-weighting) was dropped as **subsumed** by this (the real imatrix weights gate/up far
+  better, at the same 219 GB / resident / ~11 t/s). Collecting on the 16-prompt GLM calib set
+  (~134 obs/expert/layer), then rebuilding IQ2_XXS gate/up with the real imatrix.
 - **2026-06-18 — metric pivot + kernel reality; A0 building.** Built the perplexity harness and
   hit the wall that **raw-prose ppl is uninformative for GLM** (Q4 3079 ≈ Q2 3184 on 320 tok;
   see §4.1 note) — switched the primary metric to greedy-fidelity-vs-Q4 + the behavioral battery.
