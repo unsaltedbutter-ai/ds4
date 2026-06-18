@@ -293,7 +293,7 @@ Legend: [x] done · [~] partial · [ ] not started.
 ### Phase 3 — Metal + multi-token + server ← **WE ARE HERE**
 - [x] **Metal single-token decode graph (HC=1) — VALIDATED vs CPU** (2026-06-17): `--metal-graph-full-test` gpu_top==cpu_top==154822, logits rms-diff ~0.01. On GPU: HC bypass, 576/512 absorbed attention (no sinks, kq 1/√256, plain o_proj, partial kv_a_norm, no inverse-rope), dense FFN <3, shared expert, output head. Kernel: `kernel_flash_attn_ext_vec_f16_dk576_dv512` (NE=2).
 - [x] **8-expert Metal routed MoE — VALIDATED vs CPU** (2026-06-17): routed experts (≈97% FLOPs) now run on the GPU. The baseline id-based MoE path turned out to be already n_expert-general (per-`(expert,token)` dispatch; `ds4_gpu_encode_moe_sum_experts` reduces any count via a binary add chain) — **no `sum8` kernel was needed**; the only 6-hardwiring was the `n_expert > 6` guard, now `> DS4_GPU_MAX_EXPERT_USED`. GLM decode layer selects on the CPU (`metal_graph_glm_cpu_router`, sigmoid noaux_tc top-8 -> `g->router_selected/weights`) and runs experts on Metal via `ds4_gpu_routed_moe_one_tensor`. `--metal-graph-full-test` on Q2: gpu_top==cpu_top==154822, logits rms-diff 0.0136. `DS4_GLM_CPU_ROUTED_MOE=1` forces the v1 all-CPU path (A/B fallback). DeepSeek 6-expert fast paths bit-identical.
-- [x] **Multi-token generation (greedy) WORKS:** full-attention KV (`n_swa=0`) + sequential-decode prefill + multi-EOS; the multi-row attention Q-stride bug is **fixed** (`--glm-attn-test` exact to n_raw=256) and `--temp 0` now generates coherent, correct text end-to-end (~8.7 tok/s). Remaining: the default (temp>0) sampled path still SIGSEGVs in the GLM-unadapted Metal batch prefill, so sampling needs a GLM batch prefill (or routing sampled decode through the sequential driver); greedy alone loops/degrades on long output (argmax + Q2).
+- [x] **Multi-token generation WORKS (greedy + sampled, no crash):** full-attention KV (`n_swa=0`) + sequential-decode prefill (both the standalone argmax driver and the **session** path) + multi-EOS; the multi-row attention Q-stride bug is **fixed** (`--glm-attn-test` exact to n_raw=256) and the session/sampled SIGSEGV (GLM-unadapted Metal batch prefill) is **fixed** (GLM session prefill now sequential). `--temp 0` gives coherent correct text (~8.7 tok/s); sampled needs `--top-p 0.95` (GLM's default; the ds4 default top_p=1.0 does no filtering -> noisy on Q2). Speed follow-ups: GLM Metal **batch** prefill (sequential is O(prompt) single-token evals) and a GPU router to drop the per-MoE-layer sync.
 - [~] Tokenizer + chat template: `[gMASK]<sop>` framing + reasoning-effort + `<|assistant|><think>` gen prompt + multi-EOS stop set **done and ID-verified vs the real tokenizer**; `<tool_call>` render/parse + the multi-turn server chat builders (`ds4_chat_*`, `ds4_server.c`) still pending (§1b)
 - [ ] 🔴 Server answers a real prompt end to end + measure tokens/sec on notible
 
@@ -553,6 +553,21 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (**session/sampled prefill SIGSEGV fixed -- temp>0 + the server path now run**): The
+  default CLI path (`temp>0` -> `run_sampled_generation`) and the server both prefill via
+  `ds4_session_sync`, whose cold + resumed prefill called `metal_graph_prefill_layer_major` (the
+  GLM-unadapted Metal batch prefill) and **SIGSEGV'd on GLM's absent HC/compressor tensors**. Fix:
+  route GLM's session prefill through sequential decode (`metal_graph_eval_token_raw_swa` per token,
+  the validated single-token forward) for both the cold path and the checkpoint-extension loop, gated
+  on `variant==GLM` (DeepSeek unchanged). **Validated** (`glm-5.2-q2.gguf`, default temp, prompt ->
+  sampled generation): **no crash**, sequential prefill runs ("processing 33 input tokens..."), and
+  decode produces a correct start ("Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus,"). The
+  remaining low quality of *sampled* output (it fragments after the correct start) is **not a bug**:
+  `DS4_DEFAULT_TOP_P=1.0` does no nucleus filtering, so at temp 1.0 the Q2 tail gets sampled --
+  `--top-p 0.95` (GLM's `generation_config` default) gives coherent sampled output; greedy (`--temp 0`)
+  is already coherent + correct. (A reasonable follow-up: default GLM sampling to temp 1.0 / top_p 0.95.)
+  The crash fix also unblocks the **server** (it uses sessions); remaining for the finale are the GLM
+  server chat builders (`ds4_chat_*`) + `<tool_call>` and an actual end-to-end server run.
 - 2026-06-17 (**multi-row attention bug FOUND + FIXED -- multi-token generation now produces coherent,
   correct output**): The garbage was a one-line stride bug in the GLM flash-attn encoder
   (`ds4_gpu_encode_flash_attention_raw_heads_glm`): the **query** strides `nb01/nb02/nb03` (which the
