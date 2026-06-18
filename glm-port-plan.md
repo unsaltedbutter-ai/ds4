@@ -35,7 +35,12 @@ on Metal.
   Metal), first Metal forward-pass bring-up, any full-model load or Q2/Q4 run on notible.
 
 **Commitment:** flag "this step needs port 8085 down" before any 🔴 step; the user stops the
-launchd agent. Phase 0/1 and most of 2 are ✅; the gate is first crossed in Phase 3/4.
+launchd agent. Phases 0–4 are functionally complete; the gate is now crossed routinely for
+full-model Q2/Q4 runs. **Operational pattern that works (use it):** drive each full-model run from
+a *detached* script on notible with `trap restart_prod EXIT`, so prod always comes back even if the
+SSH/agent connection drops; **wait until `pgrep -f ds4-server` is empty after `--stop`** before
+launching ds4 (the launchd `--stop` is async; the instance lock refuses otherwise); each 224 GB Q2
+load is ~50–90 s. `setup-launchagents-tts.sh --stop|--start jumbo_server` via `bash -lc`.
 
 Small model config files are already downloaded on notible: `config.json`,
 `chat_template.jinja`, `generation_config.json`, `README.md`, `LICENSE`.
@@ -290,18 +295,21 @@ Legend: [x] done · [~] partial · [ ] not started.
 - [x] HC bypass, dense first-3, plain o_proj, GLM RoPE (interleaved), indexer off — **full 78-layer CPU forward, finite/sane logits**
 - [~] Reference: matched against ds4's own CPU forward (HF bf16 won't fit 256 GB); **exact-vs-official-API logprob vectors still TODO**
 
-### Phase 3 — Metal + multi-token + server ← **WE ARE HERE**
+### Phase 3 — Metal + multi-token + server — ✅ DONE
 - [x] **Metal single-token decode graph (HC=1) — VALIDATED vs CPU** (2026-06-17): `--metal-graph-full-test` gpu_top==cpu_top==154822, logits rms-diff ~0.01. On GPU: HC bypass, 576/512 absorbed attention (no sinks, kq 1/√256, plain o_proj, partial kv_a_norm, no inverse-rope), dense FFN <3, shared expert, output head. Kernel: `kernel_flash_attn_ext_vec_f16_dk576_dv512` (NE=2).
 - [x] **8-expert Metal routed MoE — VALIDATED vs CPU** (2026-06-17): routed experts (≈97% FLOPs) now run on the GPU. The baseline id-based MoE path turned out to be already n_expert-general (per-`(expert,token)` dispatch; `ds4_gpu_encode_moe_sum_experts` reduces any count via a binary add chain) — **no `sum8` kernel was needed**; the only 6-hardwiring was the `n_expert > 6` guard, now `> DS4_GPU_MAX_EXPERT_USED`. GLM decode layer selects on the CPU (`metal_graph_glm_cpu_router`, sigmoid noaux_tc top-8 -> `g->router_selected/weights`) and runs experts on Metal via `ds4_gpu_routed_moe_one_tensor`. `--metal-graph-full-test` on Q2: gpu_top==cpu_top==154822, logits rms-diff 0.0136. `DS4_GLM_CPU_ROUTED_MOE=1` forces the v1 all-CPU path (A/B fallback). DeepSeek 6-expert fast paths bit-identical.
 - [x] **Multi-token generation WORKS (greedy + sampled, no crash):** full-attention KV (`n_swa=0`) + sequential-decode prefill (both the standalone argmax driver and the **session** path) + multi-EOS; the multi-row attention Q-stride bug is **fixed** (`--glm-attn-test` exact to n_raw=256) and the session/sampled SIGSEGV (GLM-unadapted Metal batch prefill) is **fixed** (GLM session prefill now sequential). `--temp 0` gives coherent correct text (~8.7 tok/s); sampled needs `--top-p 0.95` (GLM's default; the ds4 default top_p=1.0 does no filtering -> noisy on Q2). Speed follow-ups: GLM Metal **batch** prefill (sequential is O(prompt) single-token evals) and a GPU router to drop the per-MoE-layer sync.
 - [x] Tokenizer + chat template: `[gMASK]<sop>` framing + reasoning-effort + `<|assistant|><think>` gen prompt + multi-EOS stop set **ID-verified vs the real tokenizer**; **`<tool_call>` render/parse + multi-turn server chat builders (`ds4_chat_*`) + server `render_chat_prompt_text` GLM framing all landed** (gated on `variant==GLM`, DeepSeek bit-identical; 8 no-model unit tests in `./ds4_test --server`)
-- [x] 🔴 **Server answers a real prompt end to end — VALIDATED on notible** (2026-06-17): GLM-Q2 server (`ds4-server -m glm-5.2-q2.gguf -c 2048`) renders the correct GLM frame (`--trace`: `[gMASK]<sop><|system|>Reasoning Effort: High<|user|>...<|assistant|><think>`), answers a prompt **coherently** (temp 0.6/top_p 0.95: correct planet list), at **~7.8 tok/s decode** (prefill ~8.7 t/s). Default sampling now temp 0.6/top_p 0.95 (temp 1.0 degenerates on Q2 — see §6)
+- [x] 🔴 **Server answers a real prompt end to end — VALIDATED on notible** (2026-06-17): GLM-Q2 server (`ds4-server -m glm-5.2-q2.gguf -c 2048`) renders the correct GLM frame (`--trace`: `[gMASK]<sop><|system|>Reasoning Effort: High<|user|>...<|assistant|><think>`), answers a prompt **coherently** (temp 0.6/top_p 0.95: correct planet list). Default sampling now temp 0.6/top_p 0.95 (temp 1.0 degenerates on Q2 — see §6).
+- [x] **GPU sigmoid router — VALIDATED** (2026-06-17): drops the per-MoE-layer CPU↔GPU sync. `ds4_gpu_router_select_glm_tensor` threads `sigmoid_scoring` into `ds4_gpu_encode_router_select` (bias/top-k/normalize/scale are scoring-agnostic). Numerically identical to the CPU router (logits_rms 0.01356, gpu_top==cpu_top); **Q2 generation 8.9 → 11.6 tok/s**. `DS4_GLM_CPU_ROUTER=1` forces the host router (A/B). DeepSeek path untouched (+ CUDA stub).
 
-### Phase 4 — Quant builds & streaming — ✅ mostly DONE
-- [x] **Q2 GGUF** (`/Volumes/4TB-1/glm-5.2-q2.gguf`, 218.9 GiB) and **Q4 GGUF** (408.7 GiB) built; both `--inspect`-validated
-- [~] Q2-vs-Q4 compared at the gross level (same top token, similar logit magnitudes); rigorous quality delta needs prefill + a reference
-- [ ] imatrix calibration (currently synthetic per-column-energy importance) — real activation imatrix for better Q2
-- [ ] §3b memory-fit levers: SSD-streaming expert-cache vs context, 8-bit KV (once the Metal MoE runs fully on GPU)
+### Phase 4 — Quant builds, streaming, Q2-vs-Q4 — ✅ Q2 fast; Q4 streamed (disk-bound) ← **WE ARE HERE (speed)**
+- [x] **Q2 GGUF** (`/Volumes/4TB-1/glm-5.2-q2.gguf`, 218.9 GiB) + **Q4 GGUF** (408.7 GiB) built, `--inspect`-validated. **Q2 is the fast resident target: ~11.6 tok/s, the recommended serving config.**
+- [x] **Q2-vs-Q4 quality settled** (2026-06-18): on the same greedy long prompt Q4 stays coherent (planets + a fact each) where Q2 loops → Q2's degeneration is the **2-bit quantization ceiling, not an engine bug** (with CLI==server + determinism + Metal==CPU, the engine is exonerated; §6).
+- [x] **GLM Q4 GPU expert streaming — FUNCTIONAL on CLI + server** (2026-06-18): `slots8` Q4_K kernels + `ds4_gpu_glm_streaming_routed_moe_tensor` stream the 8 routed experts/layer from the mmap into the GPU under `--ssd-streaming` (else CPU routed fallback). Correct, server-validated. **Disk-bound: ~0.42 cold / 0.76 warm tok/s** — 389 GiB of experts can't be resident on 256 GB, so the per-layer expert load dominates.
+- [ ] **Q4 streaming SPEED** (the active speed work): a **non-thrashing GLM-native LRU expert cache** (the DeepSeek 6-expert slab reuse thrashed at 0.06 tok/s → reverted; kept in git) exploiting expert-usage skew + **load/compute overlap**. Fundamentally disk-capped (~1–2 tok/s ceiling — a slice of experts is always cold).
+- [ ] **8-bit latent KV** (§3b; ds4 has FP8 KV kernels `metal/dsv4_kv.metal`) — shrinks KV (~88→44 KB/tok) for larger Q2/Q4 context **and frees RAM for the Q4 expert cache**. Independent of the disk wall — the higher-leverage next lever.
+- [ ] imatrix calibration (currently synthetic per-column-energy importance) — real activation imatrix for better Q2.
 
 ### Phase 5 — Later
 - [ ] Re-enable DSA indexer (IndexShare) for long context
@@ -406,12 +414,16 @@ test harnesses) on a few tokens — they should match within quant/precision noi
 
 ## 7b. Known gaps / cautions for whoever continues
 
-> **UPDATE 2026-06-17 (read §6 top first):** the Metal **single-token decode, 8-expert MoE, and
-> greedy multi-token generation all work and are validated.** The multi-row attention bug that this
-> section's cautions hinted at was a query-stride error (576 vs 512), now fixed; rope at pos>0 is
-> empirically confirmed by working generation. The bullets below are historical except where they
-> name still-open work (the **CPU** generation path, the **Metal batch prefill** for temp>0/server,
-> and bit-exact-vs-reference checks).
+> **UPDATE 2026-06-18 — §7/§7b/§7c are now LARGELY HISTORICAL; read the §6 status-log top first.**
+> The Metal bring-up these sections planned is **done and validated on notible**: single-token decode,
+> 8-expert MoE, multi-token generation (greedy + sampled), full chat I/O + `<tool_call>` render/parse,
+> the **HTTP server** (answers GLM prompts end to end), the **GPU sigmoid router** (~11.6 tok/s on Q2),
+> and **Q4 GPU expert streaming** (functional, disk-bound ~0.76 tok/s warm). The remaining work is
+> **speed/scale**, not bring-up: a non-thrashing GLM expert cache + load/compute overlap for Q4 (which
+> is fundamentally SSD-bound on 256 GB), 8-bit latent KV, and DSA/MTP (Phase 5). The bullets below are
+> kept only as historical context; trust §6 + §4 over them. NOTE: the "CPU generation NOT done" bullet
+> is **stale** — the Metal generation path (CLI + server) is the working release path; the CPU backend
+> remains debug/reference only.
 
 - **RoPE convention: VERIFIED OK for GLM.** ds4's `rope_tail` (ds4.c ~7010, `kernel_dsv4_rope_tail_f32`)
   rotates *adjacent pairs* `tail[i],tail[i+1]` — the **interleaved** convention, which matches GLM's
@@ -515,7 +527,12 @@ but multi-row softmax is inherited from the proven 512/512 kernel body.
 ds4.c:19493), multi-token KV full-attention retention (`n_swa=0`), expert streaming/overlap, MTP,
 CUDA+GLM.
 
-## 6b. FINAL SUMMARY (end of 2026-06-16/17 ~8h unattended run)
+## 6b. FINAL SUMMARY (end of 2026-06-16/17 ~8h unattended run) — ⚠️ SUPERSEDED
+
+> ⚠️ This summary is a point-in-time snapshot from the FIRST unattended run (CPU-only forward, no Metal
+> generation/server). It is **superseded** by the §6 status log above and §4: since then the Metal
+> decode graph, multi-token generation, the server, the GPU router, and Q4 GPU streaming all landed and
+> were validated on notible. Read §6 (top) + §4 for the current truth; this section is historical.
 
 **Outcome: GLM-5.2 loads and runs (forward pass) on ds4, validated end-to-end on the real 753 B model
 on the CPU backend. Two quantized GGUFs were produced as deliverables.** Everything is on branch
