@@ -15311,7 +15311,7 @@ static bool metal_graph_encode_decode_layer_glm(
  * rope / KV-store.  Run with --glm-attn-test from a dir containing metal/. */
 void ds4_glm_attention_unit_test(void) {
     if (!ds4_gpu_init()) { fprintf(stderr, "ds4: GPU init failed\n"); return; }
-    const uint32_t n_head = 64, key_dim = 576, value_dim = 512, raw_cap = 64;
+    const uint32_t n_head = 64, key_dim = 576, value_dim = 512, raw_cap = 320;
     const float kq_scale = 1.0f / sqrtf(256.0f);
 
     float *q = xmalloc((size_t)n_head * key_dim * sizeof(float));
@@ -15331,9 +15331,10 @@ void ds4_glm_attention_unit_test(void) {
         return;
     }
 
-    const uint32_t cases[] = { 1, 2, 3, 4, 8, 16 };
+    const uint32_t cases[] = { 1, 2, 3, 4, 8, 16, 31, 32, 33, 64, 128, 256 };
+    const int n_cases = (int)(sizeof(cases) / sizeof(cases[0]));
     double worst = 0.0;
-    for (int c = 0; c < 6; c++) {
+    for (int c = 0; c < n_cases; c++) {
         const uint32_t n_raw = cases[c];
         if (ds4_gpu_begin_commands() == 0) { fprintf(stderr, "begin failed\n"); return; }
         const int ok = ds4_gpu_attention_decode_heads_glm_tensor(heads_t, q_t, kv_t, n_raw,
@@ -15347,7 +15348,7 @@ void ds4_glm_attention_unit_test(void) {
         }
         for (uint32_t h = 0; h < n_head; h++) {
             const float *qh = q + (size_t)h * key_dim;
-            float scores[64];
+            float scores[320];
             float maxs = -1e30f;
             for (uint32_t r = 0; r < n_raw; r++) {
                 const float *kr = kv + (size_t)r * key_dim;
@@ -15375,7 +15376,7 @@ void ds4_glm_attention_unit_test(void) {
         fprintf(stderr, "ds4: GLM attn n_raw=%2u  max=%.6f rms=%.6f\n",
                 n_raw, maxdiff, sqrt(sumsq / (n_head * value_dim)));
     }
-    fprintf(stderr, "ds4: GLM attn unit test %s (worst max diff %.6f over n_raw 1..16)\n",
+    fprintf(stderr, "ds4: GLM attn unit test %s (worst max diff %.6f over n_raw 1..256)\n",
             worst < 0.01 ? "PASS" : "FAIL", worst);
     ds4_gpu_tensor_free(q_t);
     ds4_gpu_tensor_free(kv_t);
