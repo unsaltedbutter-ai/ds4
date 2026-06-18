@@ -17,7 +17,7 @@ The deep design notes, geometry map, risk register, and a dated status log live 
 | GLM chat framing, reasoning effort, multi-EOS, `<tool_call>` render/parse | **works** |
 | GPU sigmoid router (no per-MoE-layer CPU sync) | **works**, validated vs the CPU forward |
 | CPU reference forward (all 78 layers) | **works** (debug/reference only) |
-| Q4 GGUF inference | **runs, slowly** — Q4 (≈409 GiB) streams on 256 GB via the CPU routed-MoE path (validation-only, ~0.3 tok/s); a fast GPU expert cache is still WIP. Q4 confirms Q2's degeneration on hard prompts is just the 2-bit ceiling, not a bug |
+| Q4 GGUF inference (CLI + server) | **runs, GPU-streamed** — Q4 (≈409 GiB) streams the 8 routed experts/layer from the mmap into the GPU (`slots8` Q4_K kernels) under `--ssd-streaming`. Correct + server-validated, but **disk-bound** (~0.4 cold / 0.76 warm tok/s): 389 GiB of experts can't be resident on 256 GB. Use Q2 (resident, ~11.6 tok/s) for speed; Q4 for quality/validation. A non-thrashing resident expert cache + load/compute overlap is the open speed work |
 | DSA indexer (long context), MTP draft tokens | not wired for GLM yet (dense MLA attention is a correct superset) |
 
 GLM-5.2 vs DeepSeek-V4 Flash, the load-bearing deltas (all in the engine, variant-gated):
@@ -84,10 +84,11 @@ The engine auto-detects the GLM variant from the GGUF metadata.
 # Interactive chat REPL:
 ./ds4 -m glm-5.2-q2.gguf -c 4096
 
-# Q4, for validation only — runs via the CPU routed-MoE path streaming experts
-# from the demand-paged mmap (≈0.3 tok/s; a fast GPU expert cache is WIP):
-DS4_GLM_CPU_ROUTED_MOE=1 ./ds4 -m glm-5.2-q4.gguf --ssd-streaming --ssd-streaming-cold \
-  --ssd-streaming-cache-experts 1GB -p "..." -n 80 --temp 0 -c 2048
+# Q4 (GPU-streamed; disk-bound, ~0.4-0.76 tok/s) — the 8 routed experts/layer
+# stream from the mmap into the GPU.  Works for the CLI and the server:
+./ds4 -m glm-5.2-q4.gguf --ssd-streaming -p "..." -n 80 --temp 0 -c 2048
+./ds4-server -m glm-5.2-q4.gguf --ssd-streaming -c 2048 --port 8000
+# DS4_GLM_CPU_ROUTED_MOE=1 forces the CPU routed path (A/B fallback).
 ```
 
 **Sampling defaults.** GLM's nominal config is temp 1.0 / top_p 0.95, but on the 2-bit Q2
