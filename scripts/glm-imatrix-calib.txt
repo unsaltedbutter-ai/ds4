@@ -1,0 +1,99 @@
+===== DS4_IMATRIX_PROMPT 1 =====
+[gMASK]<sop><|user|>
+What are the first five planets from the Sun, with one fact about each?<|assistant|>
+The first five planets from the Sun are:
+1. Mercury - the smallest planet and the closest to the Sun, with no atmosphere to speak of.
+2. Venus - the hottest planet, wrapped in thick clouds of carbon dioxide and sulfuric acid.
+3. Earth - the only world known to harbor life, with liquid water covering most of its surface.
+4. Mars - the red planet, whose rusty color comes from iron oxide in its soil.
+5. Jupiter - the largest planet, a gas giant with a centuries-old storm called the Great Red Spot.
+===== DS4_IMATRIX_PROMPT 2 =====
+[gMASK]<sop><|user|>
+Write a Python function that returns the length of the longest strictly increasing run in a list of integers.<|assistant|>
+Here is a linear-time solution:
+
+def longest_increasing_run(nums):
+    if not nums:
+        return 0
+    best = current = 1
+    for i in range(1, len(nums)):
+        if nums[i] > nums[i - 1]:
+            current += 1
+            best = max(best, current)
+        else:
+            current = 1
+    return best
+
+It scans the list once, tracking the current run length and the best seen so far, using constant extra space.
+===== DS4_IMATRIX_PROMPT 3 =====
+[gMASK]<sop><|user|>
+Categorize this bank transaction into a spending category and explain briefly: "TRADER JOE'S #482 LOS ANGELES CA $63.18".<|assistant|>
+Category: Groceries.
+
+Trader Joe's is a grocery retailer, and the amount and location are consistent with an in-store grocery purchase. If you track food spending separately from dining out, this belongs under groceries rather than restaurants.
+===== DS4_IMATRIX_PROMPT 4 =====
+[gMASK]<sop><|user|>
+Categorize: "UBER *TRIP HELP.UBER.COM $24.90" and "SHELL OIL 57442 $48.02".<|assistant|>
+- "UBER *TRIP" -> Transportation (rideshare).
+- "SHELL OIL" -> Transportation (fuel/gas).
+
+Both are transportation costs; if you split them, the first is rideshare and the second is fuel for a personal vehicle.
+===== DS4_IMATRIX_PROMPT 5 =====
+[gMASK]<sop><|user|>
+Summarize the main idea in one sentence: maps must trade away faithful area, angle, or distance because no flat sheet can preserve all three properties of a curved surface at once.<|assistant|>
+Every flat map necessarily distorts at least one of area, angle, or distance, since a curved surface cannot be flattened without sacrificing one of those properties.
+===== DS4_IMATRIX_PROMPT 6 =====
+[gMASK]<sop><|user|>
+Explain how a mitochondrion produces energy, in plain language.<|assistant|>
+A mitochondrion breaks down nutrients and uses the released energy to pump protons across its inner membrane, creating a gradient. As those protons flow back through an enzyme called ATP synthase, the enzyme spins and stitches together ATP, the molecule cells spend as energy. Mitochondria were once free-living bacteria, which is why they keep their own small genome.
+===== DS4_IMATRIX_PROMPT 7 =====
+[gMASK]<sop><|user|>
+A train travels 240 km in 3 hours, then 180 km in 2 hours. What is its average speed for the whole trip?<|assistant|>
+Total distance is 240 + 180 = 420 km. Total time is 3 + 2 = 5 hours. Average speed is 420 / 5 = 84 km/h.
+===== DS4_IMATRIX_PROMPT 8 =====
+[gMASK]<sop><|user|>
+Translate to French: "The weather is cold today, so bring a warm coat."<|assistant|>
+Il fait froid aujourd'hui, alors apporte un manteau chaud.
+===== DS4_IMATRIX_PROMPT 9 =====
+[gMASK]<sop><|user|>
+What is the difference between weather and climate?<|assistant|>
+Weather is the state of the atmosphere over hours or days - the rain this afternoon or tonight's cold. Climate is the long-run statistical summary of weather over decades. A warming climate can still include an unusually cold winter, because climate describes the distribution from which any single day's weather is drawn.
+===== DS4_IMATRIX_PROMPT 10 =====
+[gMASK]<sop><|user|>
+Refactor this for readability: x=[i*2 for i in range(10) if i%2==0]<|assistant|>
+A clearer version names the intent and spaces out the logic:
+
+evens = range(0, 10, 2)
+doubled_evens = [value * 2 for value in evens]
+
+This makes it obvious that we take the even numbers below ten and double each one.
+===== DS4_IMATRIX_PROMPT 11 =====
+[gMASK]<sop><|user|>
+Extract the company, amount, and date as JSON: "Invoice from Acme Corp for $1,250.00 dated 2026-03-14."<|assistant|>
+{"company": "Acme Corp", "amount": 1250.00, "date": "2026-03-14"}
+===== DS4_IMATRIX_PROMPT 12 =====
+[gMASK]<sop><|user|>
+Categorize and flag anything unusual: "NETFLIX.COM $22.99", "WIRE TRANSFER TO UNKNOWN $4,000.00", "STARBUCKS #119 $6.45".<|assistant|>
+- "NETFLIX.COM" -> Subscriptions/Entertainment. Routine.
+- "WIRE TRANSFER TO UNKNOWN" -> Transfers, but flagged: a large wire to an unspecified recipient is worth verifying for fraud.
+- "STARBUCKS" -> Dining/Coffee. Routine.
+
+The wire transfer is the one to review.
+===== DS4_IMATRIX_PROMPT 13 =====
+[gMASK]<sop><|user|>
+Why does a rainbow always appear at a fixed angle from the point opposite the Sun?<|assistant|>
+Raindrops refract and reflect sunlight, and the geometry of that bending sends light back most strongly at about 42 degrees from the antisolar point - the spot directly opposite the Sun. Because the angle is fixed by the physics of refraction in water, the rainbow always forms a circle at that angular radius, arching higher when the Sun is low and flattening when the Sun is high.
+===== DS4_IMATRIX_PROMPT 14 =====
+[gMASK]<sop><|user|>
+Give three concise tips for writing a clear technical explanation.<|assistant|>
+1. State the claim first, then add detail, so the reader knows where the explanation is going.
+2. Name your assumptions explicitly rather than leaving them implicit.
+3. Point out where the argument is weakest instead of hiding it; a claim that can't fail any test explains nothing.
+===== DS4_IMATRIX_PROMPT 15 =====
+[gMASK]<sop><|user|>
+What does this shell command do: grep -rn "TODO" src/ | wc -l<|assistant|>
+It searches recursively through the src/ directory for lines containing "TODO", printing each match with its file name and line number, then pipes those matches to wc -l, which counts them. The net result is the number of TODO lines under src/.
+===== DS4_IMATRIX_PROMPT 16 =====
+[gMASK]<sop><|user|>
+Briefly: why did writing first develop for accounting rather than literature?<|assistant|>
+The earliest scripts recorded debts and inventories - grain, livestock, and labor owed - because trade and administration needed durable, transferable records that memory could not reliably hold. Only once marks could fix quantities did writing later stretch to capture law, story, and argument.
