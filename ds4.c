@@ -13379,6 +13379,15 @@ static uint32_t metal_graph_raw_span_for_batch(
         uint32_t               n_tokens) {
     if (!g || g->raw_cap == 0 || n_tokens == 0) return 0;
 
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM uses full attention (n_swa == 0): every cached position up to the
+         * last one is visible.  raw_cap is sized to the full context so the ring
+         * does not evict within a sequence. */
+        uint64_t needed = (uint64_t)pos0 + n_tokens;   /* last_pos + 1 */
+        if (needed > g->raw_cap) needed = g->raw_cap;
+        return (uint32_t)needed;
+    }
+
     const uint32_t window = g->raw_window ? g->raw_window : DS4_N_SWA;
     const uint32_t last_pos = pos0 + n_tokens - 1u;
     uint64_t needed = (uint64_t)n_tokens;
@@ -21814,6 +21823,36 @@ static bool metal_graph_verify_decode2_exact(
 /* Pick a raw SWA cache size for Metal.  During batched prefill it must cover
  * the previous window plus the current ubatch. */
 static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM is full-attention: the raw KV cache must hold every position in the
+         * sequence (no sliding window).  Size it to the context, capped for
+         * memory; longer contexts need 8-bit KV / expert streaming (plan 3b). */
+        const uint32_t glm_max = 8192u;
+        uint32_t cap = (uint32_t)ctx_size;
+        if (cap > glm_max) {
+            static bool warned = false;
+            if (!warned) {
+                fprintf(stderr,
+                        "ds4: GLM raw KV cache capped at %u rows (ctx %d); longer "
+                        "contexts need 8-bit KV / streaming\n", glm_max, ctx_size);
+                warned = true;
+            }
+            cap = glm_max;
+        }
+        if (cap == 0) cap = 1;
+        cap = (uint32_t)align_up(cap, 256u);
+        const char *glm_env = getenv("DS4_METAL_GRAPH_RAW_CAP");
+        if (glm_env && glm_env[0]) {
+            char *endp = NULL;
+            const long v = strtol(glm_env, &endp, 10);
+            if (endp != glm_env && v > 0) {
+                cap = (uint32_t)v;
+                if (cap == 0) cap = 1;
+            }
+        }
+        return cap;
+    }
+
     uint32_t raw_window = DS4_N_SWA;
     if (raw_window > (uint32_t)ctx_size) raw_window = (uint32_t)ctx_size;
     if (raw_window == 0) raw_window = 1;
@@ -23465,7 +23504,16 @@ static int generate_metal_graph_raw_swa(
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
     const double t_prefill0 = now_sec();
-    if (prefill_cap < (uint32_t)prompt->len) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* No GLM-adapted Metal batch prefill yet: prefill by sequential decode,
+         * reusing the validated single-token forward while the raw KV cache
+         * accumulates every position.  Only the final token needs logits. */
+        for (int p = 0; ok && p < prompt->len; p++) {
+            float *step_logits = (p + 1 == prompt->len) ? logits : NULL;
+            ok = metal_graph_eval_token_raw_swa(&g, model, weights,
+                                                prompt->v[p], (uint32_t)p, step_logits);
+        }
+    } else if (prefill_cap < (uint32_t)prompt->len) {
         ok = metal_graph_prefill_chunked(&g, model, weights, prompt,
                                          prompt->len, logits, false,
                                          progress, progress_ud,
