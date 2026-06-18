@@ -4443,12 +4443,12 @@ static void model_map_span_vec_include_layer_decode(
         uint32_t                il) {
     const ds4_layer_weights *l = &w->layer[il];
     model_map_span_vec_include_layer_decode_static(spans, l);
-    /* GLM reads its routed experts via ds4_gpu_routed_moe_one_tensor over the
-     * model map and does not use the DeepSeek streaming expert cache, so the
-     * expert tensors must be mapped (paged on access).  NULL for GLM dense
-     * layers, so include_one skips them there. */
-    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM ||
-        !weights_streaming_layer_experts_uniform(w, il)) {
+    /* NB GLM routed-expert streaming is not implemented: GLM reads experts via
+     * ds4_gpu_routed_moe_one_tensor over the model map and does not use the
+     * DeepSeek evicting expert cache.  Mapping all of GLM's experts here (so the
+     * reads are covered) OOMs on Q4 (408 GiB > RAM), so GLM streaming needs the
+     * proper selected-expert cache before Q4 can stream.  Q2 fits resident. */
+    if (!weights_streaming_layer_experts_uniform(w, il)) {
         model_map_span_vec_include_one(spans, l->ffn_gate_exps);
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
         model_map_span_vec_include_one(spans, l->ffn_down_exps);
