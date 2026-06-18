@@ -562,10 +562,14 @@ stayed within mmap/CPU-light bounds.
   on `variant==GLM` (DeepSeek unchanged). **Validated** (`glm-5.2-q2.gguf`, default temp, prompt ->
   sampled generation): **no crash**, sequential prefill runs ("processing 33 input tokens..."), and
   decode produces a correct start ("Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus,"). The
-  remaining low quality of *sampled* output (it fragments after the correct start) is **not a bug**:
-  `DS4_DEFAULT_TOP_P=1.0` does no nucleus filtering, so at temp 1.0 the Q2 tail gets sampled --
-  `--top-p 0.95` (GLM's `generation_config` default) gives coherent sampled output; greedy (`--temp 0`)
-  is already coherent + correct. (A reasonable follow-up: default GLM sampling to temp 1.0 / top_p 0.95.)
+  remaining low quality of *sampled* output (it fragments after the correct start) is **not a bug and
+  not a regression -- verified empirically**: (A) the SESSION path at `--temp 0.05` (near-greedy)
+  produces coherent, correct output IDENTICAL to the generate-path greedy ("...Mercury, Venus, Earth,
+  Mars, Jupiter, Saturn, Uranus..."), proving the session decode is correct; (B) the session path at
+  `--temp 0.7 --top-p 0.95` produces a coherent numbered planet list. The earlier fragmentation was
+  purely `DS4_DEFAULT_TOP_P=1.0` (no nucleus filtering -> samples the Q2 tail past the natural stop).
+  `--top-p 0.95` (GLM's `generation_config` default) fixes it; greedy (`--temp 0`) is already coherent.
+  (Reasonable follow-up: default GLM sampling to temp 1.0 / top_p 0.95.)
   The crash fix also unblocks the **server** (it uses sessions); remaining for the finale are the GLM
   server chat builders (`ds4_chat_*`) + `<tool_call>` and an actual end-to-end server run.
 - 2026-06-17 (**multi-row attention bug FOUND + FIXED -- multi-token generation now produces coherent,
