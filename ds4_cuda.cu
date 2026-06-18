@@ -8681,6 +8681,7 @@ extern "C" int ds4_gpu_glm_streaming_routed_moe_tensor(
         ds4_gpu_tensor       *mid_scratch,
         const void             *model_map,
         uint64_t                model_size,
+        uint32_t                layer,
         uint64_t                gate_offset,
         uint64_t                up_offset,
         uint64_t                down_offset,
@@ -8698,7 +8699,7 @@ extern "C" int ds4_gpu_glm_streaming_routed_moe_tensor(
         float                   clamp,
         const ds4_gpu_tensor *x) {
     (void)out; (void)gate_scratch; (void)up_scratch; (void)mid_scratch; (void)model_map;
-    (void)model_size; (void)gate_offset; (void)up_offset; (void)down_offset;
+    (void)model_size; (void)layer; (void)gate_offset; (void)up_offset; (void)down_offset;
     (void)gate_expert_bytes; (void)gate_row_bytes; (void)down_expert_bytes; (void)down_row_bytes;
     (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim; (void)selected_ids; (void)weights;
     (void)n_total_expert; (void)n_expert; (void)clamp; (void)x;

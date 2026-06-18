@@ -878,6 +878,7 @@ int ds4_gpu_glm_streaming_routed_moe_tensor(
         ds4_gpu_tensor       *mid_scratch,
         const void             *model_map,
         uint64_t                model_size,
+        uint32_t                layer,
         uint64_t                gate_offset,
         uint64_t                up_offset,
         uint64_t                down_offset,
