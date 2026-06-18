@@ -23397,6 +23397,20 @@ static void print_top_logits(
     }
 }
 
+/* True if a generated token halts the turn.  DeepSeek has a single EOS; GLM-5.2
+ * stops on any of <|endoftext|>, <|user|>, <|observation|>.  DS4_IGNORE_EOS
+ * disables stopping (debug: inspect what the model would generate past EOS). */
+static bool generation_should_stop(const ds4_vocab *vocab, int token) {
+    bool is_stop = (token == vocab->eos_id);
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        is_stop = is_stop ||
+                  (vocab->user_id >= 0 && token == vocab->user_id) ||
+                  (vocab->observation_id >= 0 && token == vocab->observation_id);
+    }
+    if (is_stop && getenv("DS4_IGNORE_EOS") != NULL) return false;
+    return is_stop;
+}
+
 /* CPU generation entry point.  It runs layer-major prefill once, then decodes
  * one token at a time using the persistent KV cache and scratch arena. */
 static int generate_raw_swa_cpu(
@@ -23466,13 +23480,7 @@ static int generate_raw_swa_cpu(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
-        bool is_stop = (token == vocab->eos_id);
-        if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
-            is_stop = is_stop ||
-                      (vocab->user_id >= 0 && token == vocab->user_id) ||
-                      (vocab->observation_id >= 0 && token == vocab->observation_id);
-        }
-        if (is_stop) break;
+        if (generation_should_stop(vocab, token)) break;
 
         if (emit) emit(emit_ud, token);
         n_generated++;
@@ -23638,13 +23646,7 @@ static int generate_metal_graph_raw_swa(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
-        bool is_stop = (token == vocab->eos_id);
-        if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
-            is_stop = is_stop ||
-                      (vocab->user_id >= 0 && token == vocab->user_id) ||
-                      (vocab->observation_id >= 0 && token == vocab->observation_id);
-        }
-        if (is_stop) break;
+        if (generation_should_stop(vocab, token)) break;
 
         if (emit) emit(emit_ud, token);
         n_generated++;
