@@ -15139,6 +15139,12 @@ static bool metal_graph_glm_cpu_routed_moe(
     return true;
 }
 
+/* Accumulate one routed layer's gate/up activation importance during imatrix
+ * collection.  Defined with the collector far below; prototyped here for
+ * metal_graph_glm_cpu_router.  `collector` is a ds4_imatrix_collector* (void* to
+ * avoid a forward declaration); inert when NULL. */
+static void imatrix_accum_gate_up(void *collector, uint32_t il, const int *selected, const float *ffn_norm);
+
 /* GLM router on the CPU (sigmoid noaux_tc scoring + biased top-8 + normalized
  * weights x2.5), written to the GPU router tensors so the routed experts can run
  * on Metal.  Mirrors metal_graph_decode_cpu_router (which is gated to DeepSeek's
@@ -15147,7 +15153,8 @@ static bool metal_graph_glm_cpu_routed_moe(
 static bool metal_graph_glm_cpu_router(
         ds4_gpu_graph          *g,
         const ds4_model        *model,
-        const ds4_layer_weights *layer) {
+        const ds4_layer_weights *layer,
+        uint32_t                il) {
     if (ds4_gpu_end_commands() == 0) return false;
     if (ds4_gpu_tensor_read(g->ffn_norm, 0, g->cpu_router_norm,
                             (uint64_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0])) == 0) {
@@ -15157,6 +15164,10 @@ static bool metal_graph_glm_cpu_router(
     int32_t selected_i32[DS4_MAX_EXPERT_USED];
     float weights[DS4_MAX_EXPERT_USED];
     layer_topk_selected_experts(selected, weights, model, layer, g->cpu_router_norm);
+    /* imatrix collection: this is the one place per layer where ffn_norm is already
+     * host-side (no extra GPU read), so accumulate gate/up importance here.  Inert
+     * unless a collector is attached. */
+    imatrix_accum_gate_up(g->imatrix_collector, il, selected, g->cpu_router_norm);
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) selected_i32[i] = (int32_t)selected[i];
     const bool wrote =
         ds4_gpu_tensor_write(g->router_selected, 0, selected_i32,
@@ -15214,10 +15225,6 @@ static bool metal_graph_glm_streaming_routed_moe(
         selected_i32, g->router_weights,
         DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
 }
-
-/* Defined far below with the imatrix collector; prototyped here for the GLM decode
- * layer's optional per-layer importance hook (collection only, g->imatrix_collector). */
-static bool imatrix_collect_layer_glm_one(void *collector, ds4_gpu_graph *g, uint32_t il);
 
 /* GLM-5.2 single-token decode layer.  GLM has no Hyper-Connections (single
  * residual stream, cur_hc is [n_embd]), no KV compression, and no indexer, so
@@ -15346,8 +15353,13 @@ static bool metal_graph_encode_decode_layer_glm(
              * read ffn_norm back and selected on the host every layer).  The MoE
              * below reads the same GPU buffers within the same command buffer.
              * DS4_GLM_CPU_ROUTER forces the validated v1 host router for A/B. */
-            if (getenv("DS4_GLM_CPU_ROUTER") != NULL) {
-                if (ok) ok = metal_graph_glm_cpu_router(g, model, layer);
+            if (g->imatrix_collector || getenv("DS4_GLM_CPU_ROUTER") != NULL) {
+                /* CPU router reads ffn_norm host-side (one sync/layer).  During
+                 * imatrix collection it also accumulates this layer's gate/up
+                 * activation importance there, which avoids a SECOND per-layer GPU
+                 * read after the MoE -- that exhausted Metal's command-buffer pool
+                 * around layer ~44 and crashed.  The experts still run on the GPU. */
+                if (ok) ok = metal_graph_glm_cpu_router(g, model, layer, il);
                 GLM_STEP("moe_router_cpu");
             } else {
                 if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model,
@@ -15393,11 +15405,6 @@ static bool metal_graph_encode_decode_layer_glm(
                                                 shared_dim, DS4_N_EMBD, g->shared_mid, 1) != 0;
         GLM_STEP("moe_shared");
         if (ok) ok = ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
-        /* imatrix collection (only when a collector is attached): accumulate this
-         * routed layer's per-expert activation importance.  Inert in normal
-         * inference (g->imatrix_collector == NULL). */
-        if (ok && g->imatrix_collector)
-            ok = imatrix_collect_layer_glm_one(g->imatrix_collector, g, il);
     }
     GLM_STEP("ffn");
     /* hc_post (ffn): plain residual add into the next residual stream. */
@@ -20854,49 +20861,28 @@ static bool imatrix_collect_layer_batch(
     return true;
 }
 
-/* Single-token GLM imatrix collect.  GLM has no Metal batch prefill, so collection
- * runs through the sequential decode layer, which keeps the FFN input in
- * g->ffn_norm, the selected expert ids in g->router_selected, and the per-slot
- * SwiGLU row in g->routed_mid.  Called from metal_graph_encode_decode_layer_glm
- * after the routed MoE: commit the in-flight command buffer so those GPU tensors
- * are materialized, read them back, accumulate sum(x^2) per (expert,column), then
- * resume encoding.  Mirrors imatrix_collect_layer_batch for one token. */
-static bool imatrix_collect_layer_glm_one(void *collector, ds4_gpu_graph *g, uint32_t il) {
+/* Accumulate one routed layer's gate/up activation importance during imatrix
+ * collection.  Called from metal_graph_glm_cpu_router, where the FFN-normalized
+ * input (ffn_norm) is already read back host-side and the top-k experts are
+ * selected -- so there is no extra per-layer GPU read (a second read per layer
+ * exhausted Metal's command-buffer pool and crashed).  gate and up share this
+ * input.  The down_proj input (routed SwiGLU row) is only materialized on the GPU
+ * after the MoE, so it is NOT collected here; the converter falls back to the
+ * synthetic per-column importance for the down_proj (see imatrix_collector_save,
+ * which omits zero-count entries).  Inert when no collector is attached. */
+static void imatrix_accum_gate_up(void *collector, uint32_t il, const int *selected, const float *ffn_norm) {
     ds4_imatrix_collector *c = collector;
-    if (!c || il >= (uint32_t)DS4_N_LAYER) return true;
-    const bool dbg = getenv("DS4_IMATRIX_DEBUG") != NULL;
-    if (dbg) fprintf(stderr, "imat il=%u end_commands\n", il);
-    if (ds4_gpu_end_commands() == 0) return false;
-    if (dbg) fprintf(stderr, "imat il=%u reads (ffn_norm=%p sel=%p mid=%p bufs n=%p s=%p m=%p)\n",
-                     il, (void*)g->ffn_norm, (void*)g->router_selected, (void*)g->routed_mid,
-                     (void*)c->ffn_norm_buf, (void*)c->selected_buf, (void*)c->routed_mid_buf);
-    const bool read_ok =
-        ds4_gpu_tensor_read(g->ffn_norm, 0, c->ffn_norm_buf,
-                            (uint64_t)DS4_N_EMBD * sizeof(c->ffn_norm_buf[0])) != 0 &&
-        ds4_gpu_tensor_read(g->router_selected, 0, c->selected_buf,
-                            (uint64_t)DS4_N_EXPERT_USED * sizeof(c->selected_buf[0])) != 0 &&
-        ds4_gpu_tensor_read(g->routed_mid, 0, c->routed_mid_buf,
-                            (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_buf[0])) != 0;
-    if (!read_ok) { ds4_gpu_begin_commands(); return false; }
-    if (dbg) fprintf(stderr, "imat il=%u accumulate sel0=%d\n", il, c->selected_buf[0]);
-
-    const float *x = c->ffn_norm_buf;
-    for (uint32_t i = 0; i < DS4_N_EMBD; i++) c->sq_tmp[i] = x[i] * x[i];
+    if (!c || il >= (uint32_t)DS4_N_LAYER) return;
+    for (uint32_t i = 0; i < DS4_N_EMBD; i++) c->sq_tmp[i] = ffn_norm[i] * ffn_norm[i];
     for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-        const int expert = c->selected_buf[slot];
+        const int expert = selected[slot];
         if (expert < 0 || (uint32_t)expert >= DS4_N_EXPERT) continue;
         float *gate_up = imatrix_gate_up_ptr(c, il, (uint32_t)expert);
         for (uint32_t i = 0; i < DS4_N_EMBD; i++) gate_up[i] += c->sq_tmp[i];
         c->gate_up_count[il][expert]++;
-        float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
-        const float *mid = c->routed_mid_buf + (size_t)slot * DS4_N_FF_EXP;
-        for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) down[i] += mid[i] * mid[i];
-        c->down_count[il][expert]++;
         c->observed_routes++;
     }
     c->observed_tokens += 1;
-    if (ds4_gpu_begin_commands() == 0) return false;
-    return true;
 }
 
 static void imatrix_write_i32(FILE *fp, int32_t v) {
@@ -20933,6 +20919,11 @@ static void imatrix_write_entry(
     free(tmp);
 }
 
+static bool imatrix_counts_nonzero(const uint32_t *counts, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) if (counts[i]) return true;
+    return false;
+}
+
 static bool imatrix_collector_save(
         const ds4_imatrix_collector *c,
         const ds4_weights           *weights,
@@ -20943,29 +20934,34 @@ static bool imatrix_collector_save(
         return false;
     }
 
-    const int32_t entries = (int32_t)(DS4_N_LAYER * 3);
+    /* Omit entries with no observations.  GLM gate/up-only collection leaves
+     * down_count zero, so the down entries are skipped and the converter falls
+     * back to the synthetic down importance.  DeepSeek collects all three. */
+    int32_t entries = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (imatrix_counts_nonzero(c->gate_up_count[il], DS4_N_EXPERT)) entries += 2;
+        if (imatrix_counts_nonzero(c->down_count[il], DS4_N_EXPERT)) entries += 1;
+    }
     imatrix_write_i32(fp, entries);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
         char name[256];
-        snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_gate_exps->name.len, layer->ffn_gate_exps->name.ptr);
-        imatrix_write_entry(fp, name,
-                            c->gate_up_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_EMBD,
-                            c->gate_up_count[il],
-                            DS4_N_EXPERT,
-                            DS4_N_EMBD);
-        snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_up_exps->name.len, layer->ffn_up_exps->name.ptr);
-        imatrix_write_entry(fp, name,
-                            c->gate_up_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_EMBD,
-                            c->gate_up_count[il],
-                            DS4_N_EXPERT,
-                            DS4_N_EMBD);
-        snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_down_exps->name.len, layer->ffn_down_exps->name.ptr);
-        imatrix_write_entry(fp, name,
-                            c->down_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_FF_EXP,
-                            c->down_count[il],
-                            DS4_N_EXPERT,
-                            DS4_N_FF_EXP);
+        if (imatrix_counts_nonzero(c->gate_up_count[il], DS4_N_EXPERT)) {
+            snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_gate_exps->name.len, layer->ffn_gate_exps->name.ptr);
+            imatrix_write_entry(fp, name,
+                                c->gate_up_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_EMBD,
+                                c->gate_up_count[il], DS4_N_EXPERT, DS4_N_EMBD);
+            snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_up_exps->name.len, layer->ffn_up_exps->name.ptr);
+            imatrix_write_entry(fp, name,
+                                c->gate_up_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_EMBD,
+                                c->gate_up_count[il], DS4_N_EXPERT, DS4_N_EMBD);
+        }
+        if (imatrix_counts_nonzero(c->down_count[il], DS4_N_EXPERT)) {
+            snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_down_exps->name.len, layer->ffn_down_exps->name.ptr);
+            imatrix_write_entry(fp, name,
+                                c->down_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_FF_EXP,
+                                c->down_count[il], DS4_N_EXPERT, DS4_N_FF_EXP);
+        }
     }
 
     const int32_t chunks = (int32_t)c->chunks;
