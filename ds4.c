@@ -10730,6 +10730,11 @@ typedef struct {
     ds4_gpu_tensor *batch_routed_down;
     ds4_gpu_tensor *batch_routed_out;
     bool batch_routed_mid_is_f16;
+    /* When non-NULL (GLM imatrix collection only), the single-token decode layer
+     * accumulates per-expert activation importance from g->ffn_norm/routed_mid/
+     * router_selected after the routed MoE.  void* to avoid a forward declaration
+     * of ds4_imatrix_collector (defined far below). */
+    void *imatrix_collector;
     ds4_gpu_tensor *batch_ffn_out;
     bool materialize_ffn_out;
     ds4_gpu_tensor *directional_steering_dirs;
@@ -15210,6 +15215,10 @@ static bool metal_graph_glm_streaming_routed_moe(
         DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
 }
 
+/* Defined far below with the imatrix collector; prototyped here for the GLM decode
+ * layer's optional per-layer importance hook (collection only, g->imatrix_collector). */
+static bool imatrix_collect_layer_glm_one(void *collector, ds4_gpu_graph *g, uint32_t il);
+
 /* GLM-5.2 single-token decode layer.  GLM has no Hyper-Connections (single
  * residual stream, cur_hc is [n_embd]), no KV compression, and no indexer, so
  * this is a flat sequence rather than the DeepSeek fused/streaming path: plain
@@ -15384,6 +15393,11 @@ static bool metal_graph_encode_decode_layer_glm(
                                                 shared_dim, DS4_N_EMBD, g->shared_mid, 1) != 0;
         GLM_STEP("moe_shared");
         if (ok) ok = ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
+        /* imatrix collection (only when a collector is attached): accumulate this
+         * routed layer's per-expert activation importance.  Inert in normal
+         * inference (g->imatrix_collector == NULL). */
+        if (ok && g->imatrix_collector)
+            ok = imatrix_collect_layer_glm_one(g->imatrix_collector, g, il);
     }
     GLM_STEP("ffn");
     /* hc_post (ffn): plain residual add into the next residual stream. */
@@ -20840,6 +20854,45 @@ static bool imatrix_collect_layer_batch(
     return true;
 }
 
+/* Single-token GLM imatrix collect.  GLM has no Metal batch prefill, so collection
+ * runs through the sequential decode layer, which keeps the FFN input in
+ * g->ffn_norm, the selected expert ids in g->router_selected, and the per-slot
+ * SwiGLU row in g->routed_mid.  Called from metal_graph_encode_decode_layer_glm
+ * after the routed MoE: commit the in-flight command buffer so those GPU tensors
+ * are materialized, read them back, accumulate sum(x^2) per (expert,column), then
+ * resume encoding.  Mirrors imatrix_collect_layer_batch for one token. */
+static bool imatrix_collect_layer_glm_one(void *collector, ds4_gpu_graph *g, uint32_t il) {
+    ds4_imatrix_collector *c = collector;
+    if (!c || il >= (uint32_t)DS4_N_LAYER) return true;
+    if (ds4_gpu_end_commands() == 0) return false;
+    const bool read_ok =
+        ds4_gpu_tensor_read(g->ffn_norm, 0, c->ffn_norm_buf,
+                            (uint64_t)DS4_N_EMBD * sizeof(c->ffn_norm_buf[0])) != 0 &&
+        ds4_gpu_tensor_read(g->router_selected, 0, c->selected_buf,
+                            (uint64_t)DS4_N_EXPERT_USED * sizeof(c->selected_buf[0])) != 0 &&
+        ds4_gpu_tensor_read(g->routed_mid, 0, c->routed_mid_buf,
+                            (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_buf[0])) != 0;
+    if (!read_ok) { ds4_gpu_begin_commands(); return false; }
+
+    const float *x = c->ffn_norm_buf;
+    for (uint32_t i = 0; i < DS4_N_EMBD; i++) c->sq_tmp[i] = x[i] * x[i];
+    for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+        const int expert = c->selected_buf[slot];
+        if (expert < 0 || (uint32_t)expert >= DS4_N_EXPERT) continue;
+        float *gate_up = imatrix_gate_up_ptr(c, il, (uint32_t)expert);
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) gate_up[i] += c->sq_tmp[i];
+        c->gate_up_count[il][expert]++;
+        float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
+        const float *mid = c->routed_mid_buf + (size_t)slot * DS4_N_FF_EXP;
+        for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) down[i] += mid[i] * mid[i];
+        c->down_count[il][expert]++;
+        c->observed_routes++;
+    }
+    c->observed_tokens += 1;
+    if (ds4_gpu_begin_commands() == 0) return false;
+    return true;
+}
+
 static void imatrix_write_i32(FILE *fp, int32_t v) {
     if (fwrite(&v, sizeof(v), 1, fp) != 1) ds4_die("failed to write imatrix");
 }
@@ -25895,6 +25948,10 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
         free(dataset);
         return 1;
     }
+    /* GLM has no Metal batch prefill (it SIGSEGVs on absent HC/compressor tensors),
+     * so GLM collection runs through the sequential decode layer, which fires the
+     * per-layer hook when g.imatrix_collector is set.  DeepSeek keeps the batch path. */
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) g.imatrix_collector = &collector;
 
     fprintf(stderr,
             "ds4: collecting routed-MoE imatrix from %s (model=%s, layers=%u, experts=%u, ctx=%d, chunk=%u)\n",
@@ -25930,6 +25987,12 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                 if (!metal_graph_reset_prefill_state(&g)) {
                     fprintf(stderr, "ds4: failed to reset imatrix graph state\n");
                     ok = false;
+                } else if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+                    /* GLM: sequential decode from pos 0; the per-layer hook
+                     * (g.imatrix_collector) accumulates importance.  No logits needed. */
+                    for (int p = 0; ok && p < prompt.len; p++)
+                        ok = metal_graph_eval_token_raw_swa(&g, model, weights,
+                                                            prompt.v[p], (uint32_t)p, NULL);
                 } else if ((uint32_t)prompt.len > prefill_cap) {
                     ok = metal_graph_prefill_chunked_range(&g, model, weights,
                                                            &prompt, 0,
