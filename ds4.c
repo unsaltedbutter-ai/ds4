@@ -15163,6 +15163,53 @@ static bool metal_graph_glm_cpu_router(
     return true;
 }
 
+/* GLM-5.2 Q4 SSD-streaming routed MoE.  Q4 (~409 GiB) can't be GPU-resident on
+ * 256 GB, so route on the CPU (the expert ids are needed host-side to locate
+ * experts in the mmap), upload the weights, then run the 8 experts on the GPU
+ * from a per-layer staging slab streamed from the mmap (slots8).  Writes
+ * g->routed_out.  Mirrors metal_graph_glm_cpu_router's router half. */
+static bool metal_graph_glm_streaming_routed_moe(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il) {
+    (void)il;
+    if (ds4_gpu_end_commands() == 0) return false;
+    if (ds4_gpu_tensor_read(g->ffn_norm, 0, g->cpu_router_norm,
+                            (uint64_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0])) == 0) {
+        return false;
+    }
+    int selected[DS4_MAX_EXPERT_USED];
+    int32_t selected_i32[DS4_MAX_EXPERT_USED];
+    float weights[DS4_MAX_EXPERT_USED];
+    layer_topk_selected_experts(selected, weights, model, layer, g->cpu_router_norm);
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) selected_i32[i] = (int32_t)selected[i];
+    if (ds4_gpu_tensor_write(g->router_weights, 0, weights,
+                             (uint64_t)DS4_N_EXPERT_USED * sizeof(weights[0])) == 0) {
+        return false;
+    }
+    if (ds4_gpu_begin_commands() == 0) return false;
+
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    return ds4_gpu_glm_streaming_routed_moe_tensor(
+        g->routed_out, g->routed_gate, g->routed_up, g->routed_mid,
+        model->map, model->size,
+        layer->ffn_gate_exps->abs_offset,
+        layer->ffn_up_exps->abs_offset,
+        layer->ffn_down_exps->abs_offset,
+        gate_expert_bytes, gate_row_bytes,
+        down_expert_bytes, down_row_bytes,
+        (uint32_t)expert_in_dim, (uint32_t)expert_mid_dim, (uint32_t)routed_out_dim,
+        selected_i32, g->router_weights,
+        DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+}
+
 /* GLM-5.2 single-token decode layer.  GLM has no Hyper-Connections (single
  * residual stream, cur_hc is [n_embd]), no KV compression, and no indexer, so
  * this is a flat sequence rather than the DeepSeek fused/streaming path: plain
@@ -15261,7 +15308,18 @@ static bool metal_graph_encode_decode_layer_glm(
          * experts (~97% of FLOPs) run on Metal via the now-8-expert-capable
          * ds4_gpu_routed_moe_one_tensor.  DS4_GLM_CPU_ROUTED_MOE forces the v1
          * all-CPU routed MoE as an A/B fallback.  Writes g->routed_out. */
-        if (getenv("DS4_GLM_CPU_ROUTED_MOE") != NULL) {
+        const bool q4_stream = g->ssd_streaming &&
+                               layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+                               ds4_gpu_q4_streaming_available();
+        if (q4_stream && getenv("DS4_GLM_CPU_ROUTED_MOE") == NULL) {
+            /* Q4 SSD streaming: route on the CPU (ids locate experts in the mmap),
+             * then run the 8 experts on the GPU from a per-layer staging slab. */
+            if (ok) ok = metal_graph_glm_streaming_routed_moe(g, model, layer, il);
+            GLM_STEP("moe_routed_stream");
+        } else if (getenv("DS4_GLM_CPU_ROUTED_MOE") != NULL || g->ssd_streaming) {
+            /* Forced CPU, or streaming requested without the GPU Q4 fast path
+             * (non-Q4 experts or slots8 kernels unavailable): the CPU routed MoE
+             * reads experts from the demand-paged mmap. */
             if (ok) ok = metal_graph_glm_cpu_routed_moe(g, model, layer, il, token);
             GLM_STEP("moe_routed_cpu");
         } else {

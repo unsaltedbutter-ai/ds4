@@ -169,6 +169,9 @@ static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_raw_store_round_buffer;
 static id<MTLBuffer> g_moe_gate_scratch_buffer;
 static id<MTLBuffer> g_moe_down_scratch_buffer;
+/* GLM Q4 SSD-streaming: per-layer staging slab for the 8 selected experts
+ * (gate+up+down), memcpy'd from the mmap each MoE layer. */
+static id<MTLBuffer> g_glm_stream_staging_buffer;
 static id<MTLBuffer> g_moe_id_map_buffer;
 static id<MTLBuffer> g_moe_q4_gate_slots_buffer;
 static id<MTLBuffer> g_moe_q4_up_slots_buffer;
@@ -315,6 +318,7 @@ static NSUInteger g_f16_round_scratch_bytes;
 static NSUInteger g_raw_store_round_bytes;
 static NSUInteger g_moe_gate_scratch_bytes;
 static NSUInteger g_moe_down_scratch_bytes;
+static NSUInteger g_glm_stream_staging_bytes;
 static NSUInteger g_moe_id_map_bytes;
 static NSUInteger g_moe_q4_gate_slots_bytes;
 static NSUInteger g_moe_q4_up_slots_bytes;
@@ -21039,9 +21043,8 @@ static int ds4_gpu_encode_mul_mv_slots6_sum6(
 }
 
 /* GLM 8-expert variants of the slots6 encoders.  Identical wiring, widened to 8
- * gate/up/down buffers with nei0==8.  Used by the GLM SSD-streaming MoE (wired in
- * a following commit; marked unused until then). */
-static int __attribute__((unused)) ds4_gpu_encode_mul_mv_slots8_pair_swiglu(
+ * gate/up/down buffers with nei0==8.  Used by the GLM SSD-streaming MoE. */
+static int ds4_gpu_encode_mul_mv_slots8_pair_swiglu(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
         const ds4_gpu_mul_mv_id_args *args,
@@ -21101,7 +21104,7 @@ static int __attribute__((unused)) ds4_gpu_encode_mul_mv_slots8_pair_swiglu(
     return 1;
 }
 
-static int __attribute__((unused)) ds4_gpu_encode_mul_mv_slots8_sum8(
+static int ds4_gpu_encode_mul_mv_slots8_sum8(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
         const ds4_gpu_mul_mv_id_args *args,
@@ -25140,6 +25143,164 @@ int ds4_gpu_routed_moe_one_tensor(
     }
 
     return 1;
+}
+
+/* GLM-5.2 Q4 SSD-streaming routed MoE (Phase 1).  Runs the 8 selected experts on
+ * the GPU, staging gate/up/down from the mmap'd model into a resident slab each
+ * MoE layer (the OS page cache keeps hot experts resident; cold ones page-fault
+ * from disk on the memcpy).  Correct and far faster than CPU routing; a
+ * persistent LRU expert cache that skips the per-layer copy for hot experts is
+ * the next optimization.  Q4_K experts only (the slots8 kernels); the caller
+ * falls back to CPU routing otherwise.  selected_ids are CPU-side because they
+ * locate experts in the mmap.  The caller's per-layer router sync (end_commands
+ * to read ffn_norm) makes reusing one staging slab safe: the prior layer's
+ * dispatch has completed before this layer's memcpy overwrites the slab. */
+int ds4_gpu_glm_streaming_routed_moe_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate_scratch,
+        ds4_gpu_tensor       *up_scratch,
+        ds4_gpu_tensor       *mid_scratch,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const int32_t          *selected_ids,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !gate_scratch || !up_scratch || !mid_scratch || !model_map ||
+        !selected_ids || !weights || !x ||
+        n_expert != 8 || n_total_expert == 0 ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0) return 0;
+    if (!g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline ||
+        !g_moe_mul_mv_slots8_q4_k_sum8_pipeline) return 0;
+
+    @autoreleasepool {
+        const uint64_t up_expert_bytes = gate_expert_bytes; /* up shares gate shape */
+        const uint64_t gate_region = (uint64_t)n_expert * gate_expert_bytes;
+        const uint64_t up_region   = (uint64_t)n_expert * up_expert_bytes;
+        const uint64_t down_region = (uint64_t)n_expert * down_expert_bytes;
+        const uint64_t staging_bytes = gate_region + up_region + down_region;
+        if (!ds4_gpu_ensure_scratch_buffer(&g_glm_stream_staging_buffer,
+                                            &g_glm_stream_staging_bytes,
+                                            (NSUInteger)staging_bytes,
+                                            "ds4_glm_stream_staging")) {
+            return 0;
+        }
+        uint8_t *staging = (uint8_t *)[g_glm_stream_staging_buffer contents];
+        const uint8_t *map = (const uint8_t *)model_map;
+
+        /* Stage the 8 selected experts (gate|up|down) from the mmap.  Cold experts
+         * page-fault here; hot ones come from the OS page cache. */
+        for (uint32_t i = 0; i < n_expert; i++) {
+            const int32_t sid = selected_ids[i];
+            if (sid < 0 || (uint32_t)sid >= n_total_expert) return 0;
+            const uint64_t id = (uint64_t)sid;
+            const uint64_t gate_src = gate_offset + id * gate_expert_bytes;
+            const uint64_t up_src   = up_offset   + id * up_expert_bytes;
+            const uint64_t down_src = down_offset + id * down_expert_bytes;
+            if (gate_src + gate_expert_bytes > model_size ||
+                up_src + up_expert_bytes > model_size ||
+                down_src + down_expert_bytes > model_size) return 0;
+            memcpy(staging + (uint64_t)i * gate_expert_bytes,
+                   map + gate_src, (size_t)gate_expert_bytes);
+            memcpy(staging + gate_region + (uint64_t)i * up_expert_bytes,
+                   map + up_src, (size_t)up_expert_bytes);
+            memcpy(staging + gate_region + up_region + (uint64_t)i * down_expert_bytes,
+                   map + down_src, (size_t)down_expert_bytes);
+        }
+
+        __unsafe_unretained id<MTLBuffer> gate_bufs[8];
+        __unsafe_unretained id<MTLBuffer> up_bufs[8];
+        __unsafe_unretained id<MTLBuffer> down_bufs[8];
+        NSUInteger gate_offs[8], up_offs[8], down_offs[8];
+        for (uint32_t i = 0; i < n_expert; i++) {
+            gate_bufs[i] = g_glm_stream_staging_buffer;
+            up_bufs[i]   = g_glm_stream_staging_buffer;
+            down_bufs[i] = g_glm_stream_staging_buffer;
+            gate_offs[i] = (NSUInteger)((uint64_t)i * gate_expert_bytes);
+            up_offs[i]   = (NSUInteger)(gate_region + (uint64_t)i * up_expert_bytes);
+            down_offs[i] = (NSUInteger)(gate_region + up_region + (uint64_t)i * down_expert_bytes);
+        }
+
+        const uint32_t n_tokens = 1;
+        const uint32_t nr0 = ds4_gpu_routed_mv_nr0(DS4_METAL_TENSOR_Q4_K);
+        const NSUInteger smem = ds4_gpu_routed_mv_smem(DS4_METAL_TENSOR_Q4_K);
+        if (nr0 == 0) return 0;
+
+        ds4_gpu_mul_mv_id_args gate_args =
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
+                                        gate_row_bytes, gate_expert_bytes,
+                                        1, n_expert, n_tokens, nr0);
+        ds4_gpu_mul_mv_id_args down_args =
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
+                                        down_row_bytes, down_expert_bytes,
+                                        n_expert, n_expert, n_tokens, nr0);
+        ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
+            .width = expert_mid_dim,
+            .rows = n_tokens * n_expert,
+            .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+            .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+            .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+            .weight_stride = sizeof(float),
+            .write_clamped = 0,
+            .clamp_value = clamp,
+        };
+
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> gatebuf = ds4_gpu_tensor_buffer(gate_scratch);
+        id<MTLBuffer> upbuf = ds4_gpu_tensor_buffer(up_scratch);
+        id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(mid_scratch);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
+        if (!xbuf || !gatebuf || !upbuf || !midbuf || !outbuf || !weightsbuf) return 0;
+
+        const bool had_batch = g_batch_cb != nil;
+        if (!had_batch && ds4_gpu_begin_commands() == 0) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        int ok = cb &&
+            ds4_gpu_encode_mul_mv_slots8_pair_swiglu(cb,
+                g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline,
+                &gate_args, &act_args,
+                gate_bufs, gate_offs, up_bufs, up_offs,
+                xbuf, ds4_gpu_tensor_offset(x),
+                gatebuf, ds4_gpu_tensor_offset(gate_scratch),
+                upbuf, ds4_gpu_tensor_offset(up_scratch),
+                midbuf, ds4_gpu_tensor_offset(mid_scratch),
+                weightsbuf, ds4_gpu_tensor_offset(weights),
+                smem, 2, false) &&
+            ds4_gpu_encode_mul_mv_slots8_sum8(cb,
+                g_moe_mul_mv_slots8_q4_k_sum8_pipeline,
+                &down_args,
+                down_bufs, down_offs,
+                midbuf, ds4_gpu_tensor_offset(mid_scratch),
+                outbuf, ds4_gpu_tensor_offset(out),
+                smem, 2);
+        if (!had_batch) {
+            ok = ds4_gpu_end_commands() != 0 && ok;
+        }
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+/* True when the slots8 Q4_K kernels built, so GLM Q4 GPU streaming can run.
+ * If false the GLM decode layer streams via the CPU routed path instead. */
+int ds4_gpu_q4_streaming_available(void) {
+    return g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline != nil &&
+           g_moe_mul_mv_slots8_q4_k_sum8_pipeline != nil;
 }
 
 int ds4_gpu_routed_moe_batch_tensor(

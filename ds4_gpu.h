@@ -868,6 +868,36 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                layer_index);
 
+/* GLM-5.2 Q4 SSD-streaming routed MoE: runs the 8 selected experts on the GPU,
+ * staging gate/up/down from the mmap each MoE layer.  selected_ids are CPU-side.
+ * Metal-only (slots8 Q4_K kernels); CUDA links a stub. */
+int ds4_gpu_glm_streaming_routed_moe_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate_scratch,
+        ds4_gpu_tensor       *up_scratch,
+        ds4_gpu_tensor       *mid_scratch,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const int32_t          *selected_ids,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x);
+
+/* True when GLM Q4 GPU streaming (slots8 Q4_K kernels) is available. */
+int ds4_gpu_q4_streaming_available(void);
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
