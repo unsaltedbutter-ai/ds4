@@ -233,6 +233,11 @@ just a token. With SSD streaming the model bytes can exceed RAM, so the real bud
 Deliverable: a recommended 256 GB recipe (quant mix + KV precision + cache budget) and the
 ctx/speed table, validated against the Q8 reference.
 
+> **Q2 *quality* (distinct from fit) now has its own doc: [`README_GLM_Q2.md`](README_GLM_Q2.md)** —
+> how the current Q2 was built (bf16→2-bit direct; IQ2_XXS g/u synthetic-imatrix + Q2_K down unweighted),
+> a run battery showing the looping/decoherence failure mode, and ranked better-Q2 options (real imatrix,
+> down-weighting, bit-allocation, new low-bit types, 8-bit KV) with a test plan + results tracker.
+
 ## 3c. Spike results (2026-06-16) — HC bypass + attention/FFN deltas
 
 **HC bypass (R1).** Hidden state is a flat `[n_hc*n_embd]` buffer (`ds4.c:~8364`),
@@ -572,6 +577,31 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-18 (**Q2 characterized + documented; better-Q2 options + test plan written → `README_GLM_Q2.md`**):
+  Per user, ran the current Q2 and documented what works/doesn't, how it was built, and how to make it
+  better. **Run** (5-prompt battery on notible via a trap-protected detached script `scripts/glm-q2-characterize.sh`;
+  prod stopped, polled `pgrep -f ds4-server` empty, restarted via `trap EXIT` — verified back UP):
+  SHORT/LONG × temp {0, 0.6, 1.0} / top_p 0.95, `-c 2048`, ~11.4 t/s greedy / ~9.9 sampled. **Finding:**
+  every mode emits the **correct planets in order** then **fails to stop — loops/repeats** (even greedy on
+  the SHORT prompt; LONG@0.6 collapsed to word-salad). Confirms the user's recollection (temp + length →
+  decoherence) and broadens it (looping is pervasive, not just temp 1.0). Generations are **thinking-on**
+  (CLI default) so much of the loop is inside the reasoning trace — flagged a thinking-off retest. **Creation
+  method (from source, corrects two priors):** the converter goes **bf16 → f32 → 2-bit directly, NO Q8
+  intermediate** (`glm-quantize.c:918`/`:790`; user's "Q8→Q2?" hypothesis is moot — already minimal lossy
+  steps); recipe = IQ2_XXS gate/up (2.06 bpw, **synthetic per-column-energy** imatrix `:783`) + Q2_K down
+  (2.625 bpw, **imatrix=NULL → unweighted** — a real gap); experts are ~93% of the 219 GiB. (Also noted the
+  output head is **Q8_0**, not F16 as README-GLM.md/§6b say.) **Better-Q2 options documented + ranked:**
+  A real activation imatrix (largest lever; −1.95% NLL on DeepSeek Q4, more at Q2 — **blocked**:
+  `ds4_engine_collect_imatrix` uses the GLM-unadapted batch prefill that SIGSEGVs, so needs the collector
+  re-pointed at GLM sequential decode *or* the GLM batch prefill adapted; + port `--imatrix` from
+  `deepseek4-quantize.c` into `glm-quantize.c`); A0 weight the down_proj with the existing synthetic imatrix
+  (free); B bit-allocation (Q2_K g/u, sensitivity-aware Q4 layers, down→Q4 — mostly off-budget on 256 GB
+  without D); C new low-bit types (IQ2_S/Q3_K/IQ3_XXS — need a converter quantizer AND a Metal MoE kernel,
+  expensive); D 8-bit latent KV (frees RAM to fund B); E direct-vs-staged = already optimal. **Test plan**:
+  eval = load-check + decoherence battery (thinking on/off) + NLL/first-tok/greedy-LCP vs Q4 anchor +
+  official GLM API (`gguf-tools/quality-testing/`, DeepSeek-shaped → adapt); iterate with `--layers` slices,
+  full builds only for quality; results tracker seeded with the baseline. Order: A0 → B2 → A → D → C. Docs
+  only this session (no engine change); DeepSeek path untouched.
 - 2026-06-17 (**GLM Q4 GPU expert streaming WORKS on the CLI + server; Q4 is fundamentally disk-bound on
   256 GB**): Built the full GLM Q4 GPU streaming path: `slots8` Q4_K kernels (pair-swiglu + sum8, clones of
   the validated slots6/sum6) + encoders + `ds4_gpu_glm_streaming_routed_moe_tensor` which routes on the CPU

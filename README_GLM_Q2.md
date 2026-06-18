@@ -1,0 +1,329 @@
+# GLM-5.2 Q2 — what it is, how it was built, and how to make it better
+
+Scope: the **Q2** GGUF on branch `ds4-glm` (`/Volumes/4TB-1/glm-5.2-q2.gguf`, 218.9 GiB)
+— the fast, resident serving target on a 256 GB M3 Ultra (~11.4 tok/s greedy decode). This doc
+covers (1) exactly how the current Q2 was produced, (2) what works and what doesn't when
+you run it, and (3) a set of candidate recipes for a *better* Q2 plus a plan to test them.
+
+It is the Q2-quality companion to `README-GLM.md` (getting-started) and `glm-port-plan.md`
+(the port tracker). For why Q2 (not Q4) is the speed target, see `glm-port-plan.md` §4/§6:
+Q4 (≈409 GiB) cannot be resident on 256 GB and is disk-bound (~0.76 tok/s); Q2 fits.
+
+---
+
+## 1. How the current Q2 was created
+
+### 1.1 One direct pass: bf16 → f32 → 2-bit. There is **no** Q8 intermediate.
+
+The converter is `gguf-tools/glm-quantize.c`. It reads the Hugging Face `zai-org/GLM-5.2`
+release (bf16 safetensors) and authors the GGUF in a single pass. For every tensor it:
+
+1. reads the bf16 source and widens it to f32 (`stdb_read_f32`; bf16→f32 is **exact** —
+   f32's mantissa is a superset of bf16's, so this step loses nothing), then
+2. quantizes that f32 **directly** to the tensor's target type (`ds4q_quantize_chunk`,
+   `glm-quantize.c:918` / the per-expert path at `:790`).
+
+So the answer to "did we go full → Q8 → Q2, with an extra lossy hop?" is **no**. The only
+lossy step is the final f32 → 2-bit quantization. We are already at the theoretical minimum
+number of lossy steps; there is no intermediate-precision GGUF to eliminate. (A Q8
+"reference" GGUF was *contemplated* during bring-up — `glm-port-plan.md` §6, 2026-06-16 —
+but it was never built or used as a quantization source; Q2 and Q4 were each quantized
+straight from the bf16 weights.)
+
+The command that produced the file:
+
+```sh
+cd gguf-tools && make glm-quantize
+./glm-quantize --hf /path/to/GLM-5.2-hf --q2 --write-full glm-5.2-q2.gguf
+```
+
+`--q2` flips two globals (`glm-quantize.c:1089`): routed-expert **gate/up → IQ2_XXS**,
+routed-expert **down → Q2_K**. Without `--q2` the experts are Q4_K (that is the Q4 build).
+The converter is threaded (`parallel_for` over heads/experts, ~28 cores on notible); a full
+78-layer Q2 write is roughly 40–60 min. `--layers N` writes only the first N layers for a
+fast partial build (load/plumbing checks; not end-to-end coherent).
+
+### 1.2 The exact per-tensor recipe (`build_plan`, `glm-quantize.c:801`)
+
+| Tensor group | Type | bits/weight | Notes |
+|---|---|---|---|
+| `token_embd` (embeddings) | F16 | 16 | |
+| `output` (lm_head, untied) | **Q8_0** | 8.5 | README-GLM.md rounds this to "F16"; the converter emits Q8_0 |
+| `output_norm`, all `*_norm`, `exp_probs_b.bias` | F32 | 32 | tiny |
+| `ffn_gate_inp` (router) | F16 | 16 | per-layer 6144×256 |
+| attention `attn_q_a/q_b/kv/output` | Q8_0 | 8.5 | absorbed MLA fold |
+| dense FFN `ffn_{gate,up,down}_dense` (layers 0–2) | Q8_0 | 8.5 | the 3 dense layers |
+| shared expert `ffn_{gate,up,down}_shexp` | Q8_0 | 8.5 | |
+| **routed experts gate/up** `ffn_{gate,up}_exps` (L≥3) | **IQ2_XXS** | **2.0625** | 256 experts × 75 layers |
+| **routed experts down** `ffn_down_exps` (L≥3) | **Q2_K** | **2.625** | 256 experts × 75 layers |
+
+**The routed experts are ~93% of the file** (≈204 GB of 219): gate/up at IQ2_XXS ≈ 124 GB,
+down at Q2_K ≈ 79 GB; everything non-routed ≈ 15 GB. So Q2 quality is, to first order,
+*entirely* about how well those 2-bit expert tensors are quantized. Everything else is
+already at 8–16 bits and is not the bottleneck.
+
+### 1.3 The importance weighting — and a gap
+
+Low-bit quantizers choose per-block scales/codes to minimize error, and they do it *better*
+when told which input columns matter (an "importance matrix" / imatrix). The current build:
+
+- **IQ2_XXS gate/up:** IQ2_XXS *requires* an imatrix (`quants.c:54`,
+  `requires_imatrix=true`). With no real activation imatrix available, the converter
+  synthesizes one: **per-column weight energy**, `imat[c] = Σ_rows weight[r,c]²`
+  (`glm-quantize.c:783`). This is a *proxy* for importance derived from the weights
+  themselves — it has no knowledge of which columns the model actually activates.
+- **Q2_K down:** Q2_K does **not** require an imatrix (`requires_imatrix=false`), so the
+  converter passes `NULL` and Q2_K falls back to its unweighted reference path
+  (`ds4q_write_q2_k_block_ref`, `quants.c:656`). **The down projection is currently
+  quantized with no importance information at all** — even the cheap synthetic one.
+
+This is the single clearest weakness in the current recipe and the starting point for §3.
+
+---
+
+## 2. Running the current Q2: what works, what doesn't
+
+### 2.1 What works
+
+- **Loads and runs resident.** `--inspect` binds + validates all 1236 tensors; the model
+  fits in 256 GB with a usable context and decodes at **~11.4 tok/s** greedy / ~9.9 sampled
+  (GPU sigmoid router, routed MoE on Metal). The server answers GLM prompts end to end.
+- **The right facts come out, in order.** Every run in §2.3 produced the correct planets
+  (Mercury → Jupiter) at the start — the model's knowledge and the engine are intact. Q2 is
+  deterministic under greedy (byte-identical run-to-run).
+- **Engine correctness is not the issue.** The Metal forward matches the CPU reference to fp
+  noise (`--metal-graph-full-test`), CLI == server, and Q4 (same engine/prompt/settings)
+  stays coherent where Q2 degrades — so degradation is the **quantization**, not a bug
+  (`glm-port-plan.md` §6, 2026-06-17/18).
+
+### 2.2 What doesn't — the temperature × length decoherence
+
+The known failure mode (and the reason the GLM default was moved to **temp 0.6 / top_p
+0.95**, not GLM's nominal temp 1.0):
+
+- **Looping / not-stopping is pervasive; temperature and length set the severity.** Even
+  greedy on the *short* prompt loops (§2.3, repeats "...Mercury."). On the long instruction
+  ("list the planets *and give a fact about each*") greedy lists them then repeats with
+  errors; **temp 0.6 collapsed into word-salad** in our draw; temp 1.0 lists then loops.
+  Higher temperature and longer / more-complex prompts make it worse — confirming the
+  recollection — and at the extreme it fragments (repeated tokens, stray CJK, truncations
+  like "2. Uran").
+- **Mechanism:** 2-bit quantization flattens the model's output distribution. Greedy still
+  picks the right top token on easy steps but doesn't know when to *stop* (over-generates /
+  loops); sampling at temp 1.0 then draws from a noisy, over-flat tail. `top_p 0.95` (nucleus
+  filtering) is what keeps sampled Q2 usable — the earlier "garbage at temp>0" was largely
+  the old `top_p=1.0` default doing no filtering at all.
+
+### 2.3 Empirical battery (this branch, Q2, `-c 2048`)
+
+Run with `scripts/glm-q2-characterize.sh` on notible. Prompts: **SHORT** = "List the first
+five planets from the Sun."; **LONG** = "...and give one interesting fact about each one."
+
+<!-- RESULTS:BEGIN (filled from the 2026-06-18 run) -->
+Generations are **thinking-on** (CLI one-shot default): the captured text is the model's
+reasoning trace, and Q2 tends to loop *inside* it without emitting `</think>` + a clean final
+answer. Speed: prefill ~11.4 t/s; decode ~11.4 (greedy) / ~9.9 (sampled).
+
+| Run | temp | top_p | gen t/s | Behavior |
+|---|---|---|---|---|
+| short_t0  | 0   | —    | 11.44 | Identifies Mercury, then **loops** "The first planet from the Sun is Mercury." — never completes the list |
+| short_t10 | 1.0 | 0.95 | 9.86  | Emits the correct list (1–5, Mercury→Jupiter) once, then repeats and degrades ("1. Jupiter") |
+| long_t0   | 0   | —    | 11.36 | Lists 1–5 correctly, then repeats the list with an error ("4. Jupiter"); gives no facts; loops |
+| long_t06  | 0.6 | 0.95 | 9.87  | Correct list, then **word-salad**: "...11. Mercury,V Mars,11.1 Mercury / 1 Mercury, Mars, Mercury" — most decoherent of the five |
+| long_t10  | 1.0 | 0.95 | 9.87  | Lists 1–5 correctly, repeats the preamble + list, loops |
+
+**What the battery shows:**
+- Every mode produces the **correct planets in the correct order at the start** — the model's
+  knowledge and the engine are intact. Q2's failure here is **degeneration / looping and not
+  stopping**, not factual error.
+- **Nothing completes the task cleanly** (5 planets + a fact each, then stop) — not even
+  greedy. Greedy is deterministic but loops; sampling can get the list out once but then
+  repeats or fragments.
+- **Decoherence worsens with length and temperature**, confirming the recollection. The long
+  prompt at temp 0.6 collapsed into word-salad in this draw (sampling is stochastic — one
+  sample is not definitive, but it shows how fragile Q2's tail is on a complex instruction).
+- Caveat / follow-up: because these are thinking-on, part of the looping is the model
+  spinning in its reasoning trace. A fair quality read should **also test thinking-off**
+  (`reasoning_effort: none` via the server) — added to §4.
+<!-- RESULTS:END -->
+
+---
+
+## 3. Options for a better Q2
+
+Goal: improve Q2 quality (less looping / decoherence, lower NLL vs reference) **while
+staying resident on 256 GB** (≈248 GB usable budget for weights + KV + scratch). Because the
+routed experts are 93% of the bytes and already at ~2 bits, the leverage is overwhelmingly in
+*how* those experts are quantized — not in the 8–16 bit remainder. Options, best
+quality-per-effort first.
+
+### Option A — Real activation imatrix (highest quality leverage)
+
+Replace the synthetic per-column-energy proxy with a **real** importance matrix collected by
+running the model over a calibration set. This is the standard win for 2-bit MoE quants. On
+DeepSeek, the same tooling gave **−1.95% NLL** on 100 official continuations at *Q4*; the
+effect is expected to be **larger at Q2**, where bit budget is scarce and importance-aware
+scale/code selection matters most (`gguf-tools/imatrix/README.md`).
+
+Three pieces are needed; the infrastructure exists for DeepSeek but was **not** ported to GLM:
+
+1. **Converter: add `--imatrix FILE`.** `glm-quantize.c` has no imatrix loader; the full
+   loader (llama.cpp legacy `.dat`, per-expert 256-vector slicing) already exists in
+   `gguf-tools/deepseek4-quantize.c` (`imatrix_load`, `imatrix_find`). Port it. **LOW–MED**
+   (the GLM expert layout is identical: 256 vectors per routed tensor).
+2. **Also weight the down_proj.** Pass the imatrix to Q2_K down (today it gets `NULL`). Q2_K
+   already supports it (`ds4q_write_q2_k_block_weighted`, `quants.c:654`). **Trivial.**
+3. **Collect a GLM imatrix — the blocker.** `ds4_engine_collect_imatrix` (`ds4.c:25844`)
+   hooks `metal_graph_prefill_layer_major` / `..._chunked_range`, i.e. the **batch prefill
+   that is not GLM-adapted and SIGSEGVs on GLM** (no HC/compressor tensors; commit `7701d0a`
+   routed GLM prefill through sequential decode for exactly this reason). So collection does
+   not work for GLM today. Two ways forward:
+   - **(b) Re-point the collector at GLM sequential decode** — accumulate the same per-expert
+     `Σ x[c]²` during `metal_graph_eval_token_raw_swa`. **MED** engine work, no batch prefill
+     needed. *Practical cost:* sequential decode is ~11 tok/s, so a large 1.5M-token imatrix
+     would take ~38 h — infeasible. A **small** budget (`--imatrix-max-tokens` ≈ 32k–130k,
+     ~1–3 h at decode speed) is the realistic target and is the small-budget shape
+     DeepSeek-Pro used (`--imatrix-max-tokens 32768`).
+   - **(a) Adapt the GLM Metal batch prefill** (a deferred speed item anyway) — then
+     collection is fast and a large imatrix becomes feasible. **MED–HIGH**, but it unblocks
+     both speed and a high-quality imatrix.
+   - Secondary: the tracked calibration dataset is DeepSeek/DSML-rendered; re-render it with
+     GLM `[gMASK]<sop>` framing (`build_ds4_imatrix_dataset.py`) for representativeness.
+
+**A0 (free first step):** even without a real imatrix, pass the *existing synthetic*
+importance to the Q2_K down_proj (currently `NULL`). One-line change, full rebuild, measure.
+It isolates "does importance on `down` help at all" before investing in collection.
+
+### Option B — Bit-allocation recipe changes (uses only already-implemented types)
+
+The converter implements quantizers for Q8_0, Q4_K, **Q2_K, IQ2_XXS**, F16, F32 — and the
+engine has Metal MoE kernels for exactly these. So these recipes need **no new kernels**:
+
+- **B1 — gate/up Q2_K instead of IQ2_XXS** (2.0625 → 2.625 bpw). Q2_K is a non-IQ K-quant
+  (no codebook grid) and can be more robust; cost ≈ **+33 GB** (→ ~252 GB total). Likely too
+  big to stay resident with real context — test on a `--layers` slice / measure fit.
+- **B2 — sensitivity-aware Q4 layers.** Keep the first few and last few MoE layers' experts
+  at Q4_K (empirically the most error-sensitive), rest at IQ2_XXS/Q2_K. ≈ **+2.7 GB per
+  upgraded layer**; ~8 layers ≈ +22 GB (→ ~241 GB) — tight but may fit at small ctx,
+  especially if paired with Option D. This is a tunable quality/RAM knob.
+- **B3 — down_proj Q4_K** (whole-model). down is often the most sensitive expert projection;
+  but 2.625 → 4.5 bpw is **+57 GB** (→ ~276 GB) — resident-infeasible, streaming-only. List
+  for completeness; probably out of budget without D.
+
+Each B recipe is a few lines in `build_plan` + a full rebuild. Gate every change on the §4
+eval, not vibes.
+
+### Option C — Better low-bit quant types (needs new quantizer **and** Metal kernel)
+
+Types in the enum but `can_quantize=false` today (`quants.c:39`): **IQ2_S** (2.5625 bpw,
+needs imatrix), **IQ2_XS** (2.3125), **Q3_K** (3.4375), **IQ3_XXS** (3.0625). IQ2_S/IQ2_XS
+are the natural "better than IQ2_XXS at ~the same size" upgrades for gate/up; Q3_K/IQ3_XXS
+are mid-bit options for down or sensitive layers. **Caveat — this is the most expensive
+option:** each new type needs *both* a converter quantizer in `quants.c` *and* a Metal MoE
+dequant/matmul kernel in `metal/moe.metal` (the runtime only has IQ2_XXS/Q2_K/Q4_K expert
+kernels). Pursue only if A + B leave quality short.
+
+### Option D — 8-bit latent KV (enabler, not a direct expert-quality lever)
+
+Already a Phase 4 item (`glm-port-plan.md` §3b; ds4 has FP8 KV kernels in
+`metal/dsv4_kv.metal`). Storing the MLA latent KV at 8-bit halves KV (~88 → ~44 KB/tok). It
+doesn't improve expert quantization directly, but it **frees RAM**, which is what makes
+Option B2 (a few Q4 expert layers) fit resident, or buys a larger context. Include it as the
+budget-maker that unblocks B.
+
+### Option E — Direct-vs-staged (the user's hypothesis): already optimal
+
+Covered in §1.1: the converter already goes bf16 → f32 → 2-bit directly, with the f32 step
+exact. There is no Q8 (or other intermediate-precision) hop to remove. **No action** — this
+option is closed; the win is in importance (A) and allocation (B), not in restructuring the
+pipeline.
+
+### Summary table
+
+| Opt | Change | New kernels? | Rebuild | Fits 256 GB? | Effort | Expected gain |
+|---|---|---|---|---|---|---|
+| A0 | synthetic imatrix on `down` too | no | full | yes (same size) | trivial | small–med |
+| A | real activation imatrix (gate/up + down) | no | full + collect | yes (same size) | med (collector) | **largest** |
+| B1 | gate/up IQ2_XXS→Q2_K | no | full | ~no (+33 GB) | low | unknown |
+| B2 | first/last MoE layers Q4_K | no | full | tight (+~22 GB) | low | med (targeted) |
+| B3 | down IQ2/Q2_K→Q4_K | no | full | no (+57 GB) | low | med, off-budget |
+| C | IQ2_S / Q3_K / IQ3_XXS | **yes** | full | depends | high | med–large |
+| D | 8-bit latent KV | (KV path) | none | frees RAM | med | enables B/ctx |
+| E | skip Q8 stage | — | — | — | none | none (already direct) |
+
+---
+
+## 4. Test plan
+
+We will build candidate GGUFs, run an identical evaluation on each, and record the numbers in
+the tracker below. "Better" = lower NLL vs reference **and** fewer decoherence failures, at a
+size that stays resident.
+
+### 4.1 Evaluation (run identically on every candidate)
+
+1. **Load check.** `./ds4 -m CAND.gguf --inspect` — binds/validates, prints size + types.
+2. **Decoherence battery.** `scripts/glm-q2-characterize.sh` (SHORT/LONG × temp {0, 0.6,
+   1.0}, top_p 0.95). Pass/fail = coherent, stops cleanly, no loop/CJK/`</think>`-spam. Run
+   it **both thinking-on and thinking-off** (`reasoning_effort: none` via the server): the
+   2026-06-18 baseline ran thinking-on and much of the looping was inside the reasoning
+   trace, so thinking-off isolates how much of the degeneration is reasoning-loop vs answer.
+3. **NLL vs reference.** Target-token negative-log-likelihood on a fixed prompt set:
+   - **Anchor = Q4** (local, high-quality, same engine). Q4 stays coherent where Q2 loops,
+     so it is a usable local pseudo-reference for first-token-match rate and **avg greedy
+     LCP** (longest common prefix) — the metrics in the DeepSeek imatrix table.
+   - **External = official GLM-5.2 API** continuations for true NLL, via
+     `gguf-tools/quality-testing/` (`collect_official.py` → `score_official.c` →
+     `compare_scores.py`: scores local GGUFs against API continuations by target-token NLL,
+     with `prompts.jsonl`). This is the gold metric — but the harness is DeepSeek-shaped;
+     verify/adapt it for GLM framing and the GLM API before trusting numbers.
+   - For quick local A/Bs without the API, a greedy/top-logit comparator is handy; the
+     DeepSeek imatrix README cites `misc/quant_eval.c`, but that file is **not present** in
+     this tree — it would need to be ported/added (or just diff greedy continuations).
+4. **Speed + fit.** Record load time, decode tok/s, and resident headroom at `-c 2048`.
+
+Metrics recorded per candidate: file size (GiB), resident fit (Y/N at `-c 2048` and a target
+ctx), decode tok/s, avg NLL, first-token-match rate, avg greedy LCP vs Q4, and the
+decoherence battery result.
+
+### 4.2 Build/iterate discipline
+
+- **Plumbing first, quality second.** Validate a recipe change with a `--layers 12` partial
+  build (load + quant-size correctness, seconds–minutes) before a full ~40–60 min build.
+- **Disk budget.** Each full Q2 variant is ≈219 GiB; `/Volumes/4TB-1` already holds q2 (219)
+  + q4 (409). Keep at most ~2–3 candidate GGUFs at once; delete losers.
+- **Gate on the eval, one variable at a time.** Don't stack recipe changes within a single
+  build or we can't attribute the delta.
+
+### 4.3 Proposed order (cheapest informative experiment first)
+
+1. **A0** — synthetic importance on `down` too. Free; tells us if `down` weighting helps.
+2. **B2** — a small sensitivity-aware Q4-layer set (e.g. first 2 + last 2 MoE layers). Cheap
+   recipe edit; targeted quality at modest RAM.
+3. **A** — port `--imatrix` to `glm-quantize.c`, re-point the collector to GLM sequential
+   decode, collect a small (~32k–130k token) GLM imatrix, rebuild gate/up + down with it.
+   The main event.
+4. **D** then **B2-extended** — if we want more Q4 layers than budget allows, add 8-bit KV to
+   free RAM, then widen the Q4 layer set.
+5. **C** — only if A+B+D leave quality short; implement IQ2_S (gate/up) and/or Q3_K (down)
+   with matching Metal kernels.
+
+### 4.4 Results tracker (newest first; fill as we execute)
+
+| Date | Variant | Size GiB | Fit | tok/s | NLL | 1st-tok | greedy LCP | Battery | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| 2026-06-18 | **baseline** (current Q2: IQ2_XXS g/u synth-imat, Q2_K down unweighted) | 218.9 | Y | ~11.6 | — | — | — | _(see §2.3)_ | reference point |
+
+---
+
+## 5. Pointers
+
+- Converter: `gguf-tools/glm-quantize.c` (`--q2` at `:1089`, `build_plan` at `:801`,
+  per-expert quant at `:770`, synthetic importance at `:783`).
+- Quantizers: `gguf-tools/quants.c` (type traits `:39`; Q2_K `:641`, IQ2_XXS `:997`,
+  Q4_K `:506`).
+- Imatrix (DeepSeek, to be ported): loader in `gguf-tools/deepseek4-quantize.c`; collector
+  `ds4_engine_collect_imatrix` (`ds4.c:25844`); dataset + docs `gguf-tools/imatrix/`.
+- Eval: `gguf-tools/quality-testing/` (present: `collect_official.py`, `score_official.c`,
+  `compare_scores.py`, `prompts.jsonl`; DeepSeek-shaped — adapt for GLM). `misc/quant_eval.c`
+  is referenced by the imatrix README but is not in this tree.
+- Characterization: `scripts/glm-q2-characterize.sh`.
