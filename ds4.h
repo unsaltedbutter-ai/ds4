@@ -55,6 +55,10 @@ typedef struct {
 #define DS4_DEFAULT_TEMPERATURE 1.0f
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
+/* GLM-5.2 generation_config recommends top_p 0.95 (temp 1.0).  The ds4 default
+ * top_p 1.0 does no nucleus filtering, which lets GLM sample its noisy quantized
+ * tail; 0.95 is the validated fix. */
+#define DS4_GLM_DEFAULT_TOP_P 0.95f
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;

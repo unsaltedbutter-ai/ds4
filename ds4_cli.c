@@ -1665,6 +1665,12 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return 1;
     }
+    /* GLM samples its quantized tail badly at top_p 1.0 (no nucleus filter); fall
+     * back to GLM's recommended 0.95 unless the user passed --top-p.  Config parse
+     * runs before model load, so detect the untouched ds4 default by value. */
+    if (ds4_is_glm() && cfg.gen.top_p == DS4_DEFAULT_TOP_P) {
+        cfg.gen.top_p = DS4_GLM_DEFAULT_TOP_P;
+    }
     if (cfg.dist && cfg.dist->role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options dist_gen = {
             .prompt = cfg.gen.prompt,
