@@ -23051,7 +23051,9 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
-    token_vec_push(tokens, e->vocab.bos_id);
+    token_vec_push(tokens, e->vocab.bos_id);   /* [gMASK] for GLM */
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM)
+        token_vec_push(tokens, e->vocab.sop_id);   /* <sop> */
 }
 
 void ds4_encode_chat_prompt(
@@ -23064,15 +23066,21 @@ void ds4_encode_chat_prompt(
 }
 
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM carries reasoning effort in a <|system|> turn at the prompt head. */
+        token_vec_push(tokens, e->vocab.system_id);
+        bpe_tokenize_text(&e->vocab, DS4_GLM_REASONING_EFFORT_MAX, tokens);
+        return;
+    }
     bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
 }
 
-static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content, token_vec *out) {
-    /* Tool output is plain data inside <tool_result>...</tool_result>.
-     * Preserve literal '<', '>' and '&' so shell output and file snippets stay
-     * intact, but escape the exact closing sentinel so a malicious or accidental
-     * tool payload cannot terminate the wrapper early. */
-    const char *end = "</tool_result>";
+static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content,
+                                          const char *end, token_vec *out) {
+    /* Tool output is plain data inside the wrapper (<tool_result> for DeepSeek,
+     * <tool_response> for GLM).  Preserve literal '<', '>' and '&' so shell
+     * output and file snippets stay intact, but escape the exact closing sentinel
+     * so a malicious or accidental tool payload cannot terminate it early. */
     const size_t endlen = strlen(end);
     const char *span = content ? content : "";
     const char *p = span;
@@ -23094,6 +23102,35 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* GLM framing (chat_template.jinja); mirrors the single-turn
+         * encode_chat_prompt GLM branch.  System text gets its own <|system|>
+         * turn, tool results land in <|observation|><tool_response> turns, and
+         * assistant history always carries a think block (empty when none). */
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            token_vec_push(tokens, vocab->system_id);
+            bpe_tokenize_text(vocab, content, tokens);
+        } else if (!strcmp(role, "assistant")) {
+            token_vec_push(tokens, vocab->assistant_id);
+            if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0) {
+                token_vec_push(tokens, vocab->think_start_id);
+                token_vec_push(tokens, vocab->think_end_id);  /* <think></think> */
+            }
+            bpe_tokenize_text(vocab, content, tokens);
+        } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            /* Callers append one tool result per turn, so each opens its own
+             * <|observation|>; a consecutive run would share one in the template. */
+            token_vec_push(tokens, vocab->observation_id);
+            bpe_tokenize_text(vocab, "<tool_response>", tokens);
+            bpe_tokenize_tool_result_text(vocab, content, "</tool_response>", tokens);
+            bpe_tokenize_text(vocab, "</tool_response>", tokens);
+        } else {
+            token_vec_push(tokens, vocab->user_id);
+            bpe_tokenize_text(vocab, content, tokens);
+        }
+        return;
+    }
+
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         bpe_tokenize_text(vocab, content, tokens);
     } else if (!strcmp(role, "assistant")) {
@@ -23105,7 +23142,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
         token_vec_push(tokens, vocab->user_id);
         bpe_tokenize_text(vocab, "<tool_result>", tokens);
-        bpe_tokenize_tool_result_text(vocab, content, tokens);
+        bpe_tokenize_tool_result_text(vocab, content, "</tool_result>", tokens);
         bpe_tokenize_text(vocab, "</tool_result>", tokens);
     } else {
         token_vec_push(tokens, vocab->user_id);
@@ -23115,6 +23152,13 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
     token_vec_push(tokens, e->vocab.assistant_id);
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* Generation prompt: <think> when thinking, else an empty <think></think>. */
+        token_vec_push(tokens, e->vocab.think_start_id);
+        if (!ds4_think_mode_enabled(think_mode))
+            token_vec_push(tokens, e->vocab.think_end_id);
+        return;
+    }
     token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
                    e->vocab.think_start_id : e->vocab.think_end_id);
 }

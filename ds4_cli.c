@@ -1024,15 +1024,18 @@ static void tokens_remove(ds4_tokens *dst, int pos, int n) {
  * API rendering path.  Changing it invalidates the session because every later
  * token position would otherwise refer to the wrong prefix. */
 static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool enable) {
+    /* The prefix sits right after the chat-begin tokens: 1 for DeepSeek (BOS),
+     * 2 for GLM ([gMASK]<sop>). */
+    const int begin_len = ds4_is_glm() ? 2 : 1;
     if (enable && chat->max_prefix_tokens == 0) {
         ds4_tokens prefix = {0};
         ds4_chat_append_max_effort_prefix(engine, &prefix);
-        tokens_insert(&chat->transcript, 1, &prefix);
+        tokens_insert(&chat->transcript, begin_len, &prefix);
         chat->max_prefix_tokens = prefix.len;
         ds4_tokens_free(&prefix);
         if (chat->session) ds4_session_invalidate(chat->session);
     } else if (!enable && chat->max_prefix_tokens > 0) {
-        tokens_remove(&chat->transcript, 1, chat->max_prefix_tokens);
+        tokens_remove(&chat->transcript, begin_len, chat->max_prefix_tokens);
         chat->max_prefix_tokens = 0;
         if (chat->session) ds4_session_invalidate(chat->session);
     }
