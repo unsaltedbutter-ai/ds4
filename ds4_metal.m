@@ -169,6 +169,9 @@ static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_raw_store_round_buffer;
 static id<MTLBuffer> g_moe_gate_scratch_buffer;
 static id<MTLBuffer> g_moe_down_scratch_buffer;
+/* GLM Q4 SSD-streaming: per-layer staging slab for the 8 selected experts
+ * (gate+up+down), memcpy'd from the mmap each MoE layer. */
+static id<MTLBuffer> g_glm_stream_staging_buffer;
 static id<MTLBuffer> g_moe_id_map_buffer;
 static id<MTLBuffer> g_moe_q4_gate_slots_buffer;
 static id<MTLBuffer> g_moe_q4_up_slots_buffer;
@@ -315,6 +318,7 @@ static NSUInteger g_f16_round_scratch_bytes;
 static NSUInteger g_raw_store_round_bytes;
 static NSUInteger g_moe_gate_scratch_bytes;
 static NSUInteger g_moe_down_scratch_bytes;
+static NSUInteger g_glm_stream_staging_bytes;
 static NSUInteger g_moe_id_map_bytes;
 static NSUInteger g_moe_q4_gate_slots_bytes;
 static NSUInteger g_moe_q4_up_slots_bytes;
@@ -25158,7 +25162,6 @@ int ds4_gpu_glm_streaming_routed_moe_tensor(
         ds4_gpu_tensor       *mid_scratch,
         const void             *model_map,
         uint64_t                model_size,
-        uint32_t                layer,
         uint64_t                gate_offset,
         uint64_t                up_offset,
         uint64_t                down_offset,
@@ -25185,51 +25188,37 @@ int ds4_gpu_glm_streaming_routed_moe_tensor(
 
     @autoreleasepool {
         const uint64_t up_expert_bytes = gate_expert_bytes; /* up shares gate shape */
+        const uint64_t gate_region = (uint64_t)n_expert * gate_expert_bytes;
+        const uint64_t up_region   = (uint64_t)n_expert * up_expert_bytes;
+        const uint64_t down_region = (uint64_t)n_expert * down_expert_bytes;
+        const uint64_t staging_bytes = gate_region + up_region + down_region;
+        if (!ds4_gpu_ensure_scratch_buffer(&g_glm_stream_staging_buffer,
+                                            &g_glm_stream_staging_bytes,
+                                            (NSUInteger)staging_bytes,
+                                            "ds4_glm_stream_staging")) {
+            return 0;
+        }
+        uint8_t *staging = (uint8_t *)[g_glm_stream_staging_buffer contents];
+        const uint8_t *map = (const uint8_t *)model_map;
 
-        /* Resident expert cache: hot experts stay wired in the slab and the GPU
-         * reads them directly (no copy); cold misses are pread into a slot.  The
-         * caller's per-layer router sync serializes layers, so the prior layer's
-         * dispatch has finished reading its entries before this layer's load may
-         * evict them -- no in-flight marking needed. */
-        ds4_gpu_stream_expert_cache_entry *entries[8] = { 0 };
-        int32_t sel[8];
-        uint64_t gate_abs[8], up_abs[8], down_abs[8];
-        uint32_t missing_mask = 0;
+        /* Stage the 8 selected experts (gate|up|down) from the mmap.  Cold experts
+         * page-fault here; hot ones come from the OS page cache. */
         for (uint32_t i = 0; i < n_expert; i++) {
             const int32_t sid = selected_ids[i];
             if (sid < 0 || (uint32_t)sid >= n_total_expert) return 0;
-            sel[i] = sid;
             const uint64_t id = (uint64_t)sid;
-            gate_abs[i] = gate_offset + id * gate_expert_bytes;
-            up_abs[i]   = up_offset   + id * up_expert_bytes;
-            down_abs[i] = down_offset + id * down_expert_bytes;
-            entries[i] = ds4_gpu_stream_expert_cache_peek(model_map, model_size, layer,
-                            (uint32_t)sid, n_total_expert, n_expert,
-                            gate_abs[i], up_abs[i], down_abs[i],
-                            gate_expert_bytes, down_expert_bytes);
-            if (!entries[i]) missing_mask |= 1u << i;
-        }
-        /* Load missing experts.  The cache loader is 6-wide (DeepSeek routes 6),
-         * so feed GLM's 8 in groups of <=6; the cache is far larger than 8 slots,
-         * so group 2 never evicts group 1's just-loaded experts. */
-        for (uint32_t base = 0; base < n_expert; base += 6) {
-            const uint32_t grp = (n_expert - base) < 6u ? (n_expert - base) : 6u;
-            const uint32_t grp_mask = (missing_mask >> base) & ((1u << grp) - 1u);
-            if (grp_mask == 0) continue;
-            int32_t sid6[6] = { 0 };
-            uint64_t g6[6] = { 0 }, u6[6] = { 0 }, d6[6] = { 0 };
-            for (uint32_t j = 0; j < grp; j++) {
-                sid6[j] = sel[base + j];
-                g6[j] = gate_abs[base + j];
-                u6[j] = up_abs[base + j];
-                d6[j] = down_abs[base + j];
-            }
-            if (!ds4_gpu_stream_expert_cache_load_selected_missing(
-                    model_map, model_size, layer, sid6, n_total_expert, grp,
-                    g6, u6, d6, gate_expert_bytes, down_expert_bytes,
-                    grp_mask, &entries[base])) {
-                return 0;
-            }
+            const uint64_t gate_src = gate_offset + id * gate_expert_bytes;
+            const uint64_t up_src   = up_offset   + id * up_expert_bytes;
+            const uint64_t down_src = down_offset + id * down_expert_bytes;
+            if (gate_src + gate_expert_bytes > model_size ||
+                up_src + up_expert_bytes > model_size ||
+                down_src + down_expert_bytes > model_size) return 0;
+            memcpy(staging + (uint64_t)i * gate_expert_bytes,
+                   map + gate_src, (size_t)gate_expert_bytes);
+            memcpy(staging + gate_region + (uint64_t)i * up_expert_bytes,
+                   map + up_src, (size_t)up_expert_bytes);
+            memcpy(staging + gate_region + up_region + (uint64_t)i * down_expert_bytes,
+                   map + down_src, (size_t)down_expert_bytes);
         }
 
         __unsafe_unretained id<MTLBuffer> gate_bufs[8];
@@ -25237,11 +25226,12 @@ int ds4_gpu_glm_streaming_routed_moe_tensor(
         __unsafe_unretained id<MTLBuffer> down_bufs[8];
         NSUInteger gate_offs[8], up_offs[8], down_offs[8];
         for (uint32_t i = 0; i < n_expert; i++) {
-            if (!entries[i] || !entries[i]->gate_buffer ||
-                !entries[i]->up_buffer || !entries[i]->down_buffer) return 0;
-            gate_bufs[i] = entries[i]->gate_buffer; gate_offs[i] = entries[i]->gate_inner;
-            up_bufs[i]   = entries[i]->up_buffer;   up_offs[i]   = entries[i]->up_inner;
-            down_bufs[i] = entries[i]->down_buffer; down_offs[i] = entries[i]->down_inner;
+            gate_bufs[i] = g_glm_stream_staging_buffer;
+            up_bufs[i]   = g_glm_stream_staging_buffer;
+            down_bufs[i] = g_glm_stream_staging_buffer;
+            gate_offs[i] = (NSUInteger)((uint64_t)i * gate_expert_bytes);
+            up_offs[i]   = (NSUInteger)(gate_region + (uint64_t)i * up_expert_bytes);
+            down_offs[i] = (NSUInteger)(gate_region + up_region + (uint64_t)i * down_expert_bytes);
         }
 
         const uint32_t n_tokens = 1;

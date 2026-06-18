@@ -15173,6 +15173,7 @@ static bool metal_graph_glm_streaming_routed_moe(
         const ds4_model        *model,
         const ds4_layer_weights *layer,
         uint32_t                il) {
+    (void)il;
     if (ds4_gpu_end_commands() == 0) return false;
     if (ds4_gpu_tensor_read(g->ffn_norm, 0, g->cpu_router_norm,
                             (uint64_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0])) == 0) {
@@ -15198,7 +15199,7 @@ static bool metal_graph_glm_streaming_routed_moe(
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     return ds4_gpu_glm_streaming_routed_moe_tensor(
         g->routed_out, g->routed_gate, g->routed_up, g->routed_mid,
-        model->map, model->size, il,
+        model->map, model->size,
         layer->ffn_gate_exps->abs_offset,
         layer->ffn_up_exps->abs_offset,
         layer->ffn_down_exps->abs_offset,
