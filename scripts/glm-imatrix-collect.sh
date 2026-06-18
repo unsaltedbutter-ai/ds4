@@ -14,7 +14,10 @@ MODEL="${1:?usage: glm-imatrix-collect.sh MODEL OUT.dat [extra args]}"
 OUTDAT="${2:?usage: glm-imatrix-collect.sh MODEL OUT.dat [extra args]}"; shift 2
 DS4DIR=/Users/notible/Documents/ds4-glm
 LAUNCH=/Users/notible/Documents/unsaltedbutter/scripts/setup-launchagents-tts.sh
-DATASET="$DS4DIR/scripts/glm-imatrix-calib.txt"
+# Calibration dataset (DS4_IMATRIX_PROMPT-marker format).  Override with DATASET=... ;
+# e.g. the large existing corpus gguf-tools/imatrix/dataset/rendered_prompts.txt for a
+# denser imatrix (bound it with --imatrix-max-tokens N).
+DATASET="${DATASET:-$DS4DIR/scripts/glm-imatrix-calib.txt}"
 OUT=/tmp/glm-imatrix-collect
 
 restart_prod() { bash -lc "$LAUNCH --start jumbo_server" >>"$OUT/prod.log" 2>&1; echo "[trap] $(date)" >>"$OUT/prod.log"; }
