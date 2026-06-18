@@ -555,6 +555,25 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (**Phase 1 of fast Q4 GPU streaming begun: slots8 Q4_K kernels landed (foundation)**): Goal
+  (per user): make the ds4 server + agent fast on Q4 streamed from SSD -- build it, cache it, then KV-quant.
+  DeepSeek's streaming MoE dispatch is slots6/sum6 (6 experts hardwired: `n_expert==6` gates + `for i<6`
+  loops in `ds4_gpu_routed_moe_one_tensor`); GLM routes 8, so GLM needs its own 8-expert dispatch.  **Landed:**
+  `kernel_mul_mv_slots8_q4_K_pair_swiglu_f32` + `kernel_mul_mv_slots8_q4_K_sum8_f32` in `metal/moe.metal`
+  (exact clones of the validated slots6/sum6, widened to 8 gate/up/down buffers + switch 0..7), their encoders
+  `ds4_gpu_encode_mul_mv_slots8_{pair_swiglu,sum8}` in `ds4_metal.m`, and non-fatal pipelines
+  `g_moe_mul_mv_slots8_q4_k_{pair_swiglu,sum8}_pipeline` (nil on build failure -> GLM streaming falls back to
+  CPU routing; Q2/DeepSeek init unaffected).  Builds clean; kernels compile at runtime so they're
+  runtime-validated once wired.  **Remaining Phase 1 (next):** an isolated `ds4_gpu_glm_streaming_routed_moe`
+  that, per MoE layer: (1) stages the 8 selected experts' gate/up/down into 8 GPU slot buffers (pread from the
+  GGUF), (2) sets up `ds4_gpu_mul_mv_id_args` (ne00=expert_in 6144, ne01=mid 2048, nei0=8, nei1=1, nb01=row
+  bytes) + `swiglu_weight_args` (mid_row_stride/weight_stride/clamp) mirroring the slots6 dispatch setup in
+  `ds4_gpu_routed_moe_one_tensor` (~ds4_metal.m:24600), (3) calls slots8 pair_swiglu -> mid then slots8 sum8
+  -> routed_out; + a public entry (+ CUDA stub) wired into `metal_graph_encode_decode_layer_glm` when
+  `g->ssd_streaming` (else the current resident/CPU path).  Validate on notible: `--metal-graph-full-test` on
+  Q4 (GPU stream vs CPU) then generation speed.  **Phase 2:** add the LRU expert cache (reuse the slab/peek/
+  pread primitives `ds4_gpu_stream_expert_cache_peek` etc.) so hot experts skip disk; then overlap cold loads
+  with shared-expert compute.  **Phase 4:** 8-bit latent KV (`metal/dsv4_kv.metal`) for Q4 + big context.
 - 2026-06-17 (**Q4 RUNS (minimal CPU-routed path) and SETTLES the Q2-quality question: Q2's degeneration
   is 2-bit quantization, not a bug**): Found a zero-new-code path to run the 409 GiB Q4 on the 256 GB box:
   `--ssd-streaming` (Metal residency restricted to the token embedding + non-routed weights; experts stay
