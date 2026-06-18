@@ -2019,8 +2019,30 @@ bad:
     return false;
 }
 
+/* GLM tool preamble (chat_template.jinja): function signatures inside
+ * <tools></tools>, calls emitted as the bare <tool_call> grammar (no outer
+ * container, <arg_key>/<arg_value> pairs).  The caller opens the enclosing
+ * <|system|> block.  Pure (no variant check) so it is unit-testable directly. */
+static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
+    buf_puts(b,
+        "\n# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n"
+        "<tools>\n");
+    buf_puts(b, tool_schemas);
+    buf_puts(b,
+        "\n</tools>\n\n"
+        "For each function call, output the function name and arguments within the following XML format:\n"
+        "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
+        "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>");
+}
+
 static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
     if (!tool_schemas || !tool_schemas[0]) return;
+    if (ds4_is_glm()) {
+        append_glm_tools_prompt_text(b, tool_schemas);
+        return;
+    }
     buf_puts(b,
         "## Tools\n\n"
         "You have access to a set of tools to help answer the user question. "
@@ -2172,6 +2194,22 @@ static void append_tool_result_text(buf *b, const char *s) {
     }
 }
 
+/* GLM wraps tool output in <tool_response>...</tool_response>.  As with DeepSeek
+ * we keep the payload literal and only neutralize the wrapper's own closing tag
+ * so a tool result that contains it cannot terminate the block early. */
+static void append_tool_response_text(buf *b, const char *s) {
+    const char *end = "</tool_response>";
+    const size_t endlen = strlen(end);
+    for (s = s ? s : ""; *s;) {
+        if (!strncmp(s, end, endlen)) {
+            buf_puts(b, "&lt;");
+            s++;
+        } else {
+            buf_putc(b, *s++);
+        }
+    }
+}
+
 static void append_dsml_json_literal(buf *b, const char *s) {
     const char *end = "</｜DSML｜parameter>";
     const size_t endlen = strlen(end);
@@ -2261,6 +2299,44 @@ static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
     buf_puts(b, "</｜DSML｜tool_calls>");
 }
 
+/* GLM tool calls have no outer container: each call is a bare
+ *   <tool_call>{name}<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
+ * with string arguments emitted verbatim and every other type as JSON (matching
+ * `v | tojson if v is not string else v` in chat_template.jinja). */
+static void append_glm_tool_calls_text(buf *b, const tool_calls *calls) {
+    if (!calls || calls->len == 0) return;
+    /* Replay the model's own bytes when present so the cached prefix stays
+     * identical and parse->render round-trips exactly. */
+    if (calls->raw_dsml && calls->raw_dsml[0]) {
+        buf_puts(b, calls->raw_dsml);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        buf_puts(b, "<tool_call>");
+        buf_puts(b, tc->name ? tc->name : "");
+        json_args args = {0};
+        if (json_args_parse(tc->arguments, &args)) {
+            for (int k = 0; k < args.len; k++) {
+                buf_puts(b, "<arg_key>");
+                buf_puts(b, args.v[k].key ? args.v[k].key : "");
+                buf_puts(b, "</arg_key><arg_value>");
+                /* json_args_parse already strips quotes from string values and
+                 * minifies non-string ones, so the stored text is exactly the
+                 * GLM on-the-wire form for both. */
+                buf_puts(b, args.v[k].value ? args.v[k].value : "");
+                buf_puts(b, "</arg_value>");
+            }
+            json_args_free(&args);
+        } else if (tc->arguments && tc->arguments[0]) {
+            buf_puts(b, "<arg_key>arguments</arg_key><arg_value>");
+            buf_puts(b, tc->arguments);
+            buf_puts(b, "</arg_value>");
+        }
+        buf_puts(b, "</tool_call>");
+    }
+}
+
 static bool role_is_system(const char *role) {
     return !strcmp(role, "system") || !strcmp(role, "developer");
 }
@@ -2283,9 +2359,91 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+/* GLM-5.2 chat rendering (chat_template.jinja).  Different enough from DeepSeek's
+ * framing to warrant its own renderer: [gMASK]<sop> head, reasoning-effort and
+ * tool schemas in their own <|system|> turns, <|observation|><tool_response>
+ * results, and no per-turn EOS (the next role token delimits a turn).  The text
+ * is tokenized later through special_token_at, which already maps the GLM
+ * specials ([gMASK], <sop>, <|user|>, <|assistant|>, <|system|>, <|observation|>,
+ * <think>, </think>); everything else (<tool_call>, <arg_key>, <tool_response>)
+ * is ordinary text the BPE tokenizer encodes directly. */
+static char *render_chat_prompt_text_glm(const chat_msgs *msgs, const char *tool_schemas,
+                                         ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    int last_user_idx = -1;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        if (role_is_user_like(msgs->v[i].role)) last_user_idx = i;
+    }
+
+    buf out = {0};
+    buf_puts(&out, "[gMASK]<sop>");
+
+    /* Prompt-head <|system|> blocks: reasoning effort (when thinking) then tools.
+     * User system messages render in place inside the loop, as the template does. */
+    const char *effort = ds4_glm_reasoning_effort_text(think_mode);
+    if (effort) {
+        buf_puts(&out, "<|system|>");
+        buf_puts(&out, effort);
+    }
+    if (tool_schemas && tool_schemas[0]) {
+        buf_puts(&out, "<|system|>");
+        append_glm_tools_prompt_text(&out, tool_schemas);
+    }
+
+    bool pending_assistant = false;
+    bool prev_was_tool = false;
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            buf_puts(&out, "<|system|>");
+            buf_puts(&out, m->content ? m->content : "");
+            prev_was_tool = false;
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<|user|>");
+            buf_puts(&out, m->content ? m->content : "");
+            pending_assistant = true;
+            prev_was_tool = false;
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            /* <|observation|> opens a run of consecutive tool results; each
+             * result is its own <tool_response> wrapper inside that run. */
+            if (!prev_was_tool) buf_puts(&out, "<|observation|>");
+            buf_puts(&out, "<tool_response>");
+            append_tool_response_text(&out, m->content);
+            buf_puts(&out, "</tool_response>");
+            pending_assistant = true;
+            prev_was_tool = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(&out, "<|assistant|>");
+            /* Reasoning is preserved only for the live turn (after the last user
+             * message); earlier turns collapse to an empty <think></think>. */
+            if (think && i > last_user_idx && m->reasoning && m->reasoning[0]) {
+                buf_puts(&out, "<think>");
+                buf_puts(&out, m->reasoning);
+                buf_puts(&out, "</think>");
+            } else {
+                buf_puts(&out, "<think></think>");
+            }
+            buf_puts(&out, m->content ? m->content : "");
+            append_glm_tool_calls_text(&out, &m->calls);
+            pending_assistant = false;
+            prev_was_tool = false;
+        }
+    }
+
+    /* Generation prompt.  GLM emits no per-turn EOS, so a trailing assistant turn
+     * (prefill) is simply continued; otherwise open a fresh assistant turn. */
+    if (pending_assistant) {
+        buf_puts(&out, "<|assistant|>");
+        buf_puts(&out, think ? "<think>" : "<think></think>");
+    }
+
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      ds4_think_mode think_mode) {
+    if (ds4_is_glm()) return render_chat_prompt_text_glm(msgs, tool_schemas, think_mode);
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
@@ -4227,6 +4385,8 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 #define DS4_PARAM_END_SHORT "</" DS4_DSML_SHORT "parameter>"
 
 static const char *find_any_tool_start(const char *s) {
+    /* GLM has no <tool_calls> container; each call opens with <tool_call>. */
+    if (ds4_is_glm()) return strstr(s, "<tool_call>");
     const char *best = NULL;
     const char *candidates[] = {
         strstr(s, DS4_TOOL_CALLS_START),
@@ -4240,6 +4400,7 @@ static const char *find_any_tool_start(const char *s) {
 }
 
 static const char *find_any_tool_end(const char *s) {
+    if (ds4_is_glm()) return strstr(s, "</tool_call>");
     const char *best = NULL;
     const char *candidates[] = {
         strstr(s, DS4_TOOL_CALLS_END),
@@ -4444,6 +4605,100 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+/* GLM <arg_value> carries no type tag: the template emits string arguments
+ * verbatim and every other type via tojson.  Recover the type by trying to parse
+ * the value as one complete JSON value; if it consumes the whole (trimmed)
+ * string, keep it raw, otherwise treat it as a plain string and quote it. */
+static bool glm_arg_value_is_json(const char *val) {
+    const char *p = val ? val : "";
+    json_ws(&p);
+    if (!*p) return false;
+    if (!json_skip_value(&p)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
+/* Parse GLM tool calls out of generated text.  Each call is a bare
+ *   <tool_call>{name}<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
+ * with no outer container; several may run back-to-back.  On a structural
+ * failure we keep the text as content rather than abort the turn, matching the
+ * DSML parser's posture.  Pure (no variant check) so it is unit-testable. */
+static bool parse_generated_message_glm(const char *text, const char *tool_search,
+                                        char **content_out, char **reasoning_out,
+                                        tool_calls *calls) {
+    const char *start = strstr(tool_search, "<tool_call>");
+    if (!start) {
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+        return true;
+    }
+    size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
+    const char *raw_block_start = start;
+    const char *raw_block_end = start;
+    const char *p = start;
+    for (;;) {
+        const char *q = skip_ascii_ws(p);
+        if (strncmp(q, "<tool_call>", 11) != 0) break;
+        q += 11;
+        /* The name runs up to the first <arg_key> or the closing </tool_call>. */
+        const char *name_end = q;
+        while (*name_end && strncmp(name_end, "<arg_key>", 9) != 0 &&
+               strncmp(name_end, "</tool_call>", 12) != 0) {
+            name_end++;
+        }
+        size_t name_lo = 0, name_hi = (size_t)(name_end - q);
+        while (name_lo < name_hi && isspace((unsigned char)q[name_lo])) name_lo++;
+        while (name_hi > name_lo && isspace((unsigned char)q[name_hi - 1])) name_hi--;
+        char *name = xstrndup(q + name_lo, name_hi - name_lo);
+
+        p = name_end;
+        buf args = {0};
+        bool ok = true;
+        while (!strncmp(p, "<arg_key>", 9)) {
+            p += 9;
+            const char *k_end = strstr(p, "</arg_key>");
+            if (!k_end) { ok = false; break; }
+            char *key = xstrndup(p, (size_t)(k_end - p));
+            p = skip_ascii_ws(k_end + 10 /* </arg_key> */);
+            if (strncmp(p, "<arg_value>", 11) != 0) { free(key); ok = false; break; }
+            p += 11;
+            const char *v_end = strstr(p, "</arg_value>");
+            if (!v_end) { free(key); ok = false; break; }
+            char *val = xstrndup(p, (size_t)(v_end - p));
+            tool_call_json_args_add(&args, key, val,
+                                    glm_arg_value_is_json(val) ? "false" : "true");
+            free(key);
+            free(val);
+            p = skip_ascii_ws(v_end + 12 /* </arg_value> */);
+        }
+        if (!ok || strncmp(p, "</tool_call>", 12) != 0) {
+            free(name);
+            buf_free(&args);
+            break;
+        }
+        p += 12;
+        raw_block_end = p;
+
+        tool_call tc = {0};
+        tc.name = name;
+        buf wrapped = {0};
+        buf_putc(&wrapped, '{');
+        buf_puts(&wrapped, args.ptr ? args.ptr : "");
+        buf_putc(&wrapped, '}');
+        tc.arguments = buf_take(&wrapped);
+        tool_calls_push(calls, tc);
+        buf_free(&args);
+    }
+    if (calls->len == 0) {
+        /* A lone or malformed "<tool_call>" with no complete block: plain text. */
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+        return true;
+    }
+    free(calls->raw_dsml);
+    calls->raw_dsml = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
+    split_reasoning_content(text, content_len, content_out, reasoning_out);
+    return true;
+}
+
 static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls) {
@@ -4466,6 +4721,11 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
             return true;
         }
         tool_search = think_end + 8;
+    }
+
+    if (ds4_is_glm()) {
+        return parse_generated_message_glm(text, tool_search, content_out,
+                                           reasoning_out, calls);
     }
 
     const char *start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START);
@@ -15757,6 +16017,171 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+/* GLM-5.2 chat render/parse tests.  The GLM workers are pure (the variant check
+ * lives only in their public dispatchers), so these call them directly and run
+ * with no model loaded, the same way --glm-attn-test validates the attention
+ * kernel locally.  Expected strings are taken from chat_template.jinja. */
+static void test_glm_render_basic_framing(void) {
+    chat_msgs msgs = {0};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, u);
+
+    char *none = render_chat_prompt_text_glm(&msgs, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(!strcmp(none, "[gMASK]<sop><|user|>Hello<|assistant|><think></think>"));
+    free(none);
+
+    char *high = render_chat_prompt_text_glm(&msgs, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(!strcmp(high,
+        "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hello<|assistant|><think>"));
+    free(high);
+
+    char *max = render_chat_prompt_text_glm(&msgs, NULL, DS4_THINK_MAX);
+    TEST_ASSERT(strstr(max, "<|system|>Reasoning Effort: Max") != NULL);
+    size_t mlen = strlen(max);
+    TEST_ASSERT(mlen >= 7 && !strcmp(max + mlen - 7, "<think>"));
+    free(max);
+
+    chat_msgs_free(&msgs);
+}
+
+static void test_glm_render_drops_old_reasoning(void) {
+    chat_msgs msgs = {0};
+    chat_msg u1 = {0}; u1.role = xstrdup("user"); u1.content = xstrdup("Q1");
+    chat_msgs_push(&msgs, u1);
+    chat_msg a1 = {0}; a1.role = xstrdup("assistant");
+    a1.reasoning = xstrdup("OLD THOUGHTS"); a1.content = xstrdup("A1");
+    chat_msgs_push(&msgs, a1);
+    chat_msg u2 = {0}; u2.role = xstrdup("user"); u2.content = xstrdup("Q2");
+    chat_msgs_push(&msgs, u2);
+
+    char *p = render_chat_prompt_text_glm(&msgs, NULL, DS4_THINK_HIGH);
+    /* A historical assistant turn (before the last user) collapses to an empty
+     * think; its reasoning text is gone. */
+    TEST_ASSERT(strstr(p, "OLD THOUGHTS") == NULL);
+    TEST_ASSERT(strstr(p, "<|assistant|><think></think>A1") != NULL);
+    /* The live turn opens with <think> after the last user. */
+    size_t n = strlen(p);
+    TEST_ASSERT(n >= 7 && !strcmp(p + n - 7, "<think>"));
+    free(p);
+    chat_msgs_free(&msgs);
+}
+
+static void test_glm_render_system_and_tool_results(void) {
+    chat_msgs msgs = {0};
+    chat_msg s = {0}; s.role = xstrdup("system"); s.content = xstrdup("Be brief");
+    chat_msgs_push(&msgs, s);
+    chat_msg u = {0}; u.role = xstrdup("user"); u.content = xstrdup("Hi");
+    chat_msgs_push(&msgs, u);
+    chat_msg t1 = {0}; t1.role = xstrdup("tool"); t1.content = xstrdup("R1");
+    chat_msgs_push(&msgs, t1);
+    chat_msg t2 = {0}; t2.role = xstrdup("tool"); t2.content = xstrdup("R2");
+    chat_msgs_push(&msgs, t2);
+
+    char *p = render_chat_prompt_text_glm(&msgs, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(strstr(p, "<|system|>Be brief") != NULL);
+    /* One <|observation|> opens the run; each result keeps its own wrapper. */
+    TEST_ASSERT(strstr(p,
+        "<|observation|><tool_response>R1</tool_response>"
+        "<tool_response>R2</tool_response>") != NULL);
+    const char *first = strstr(p, "<|observation|>");
+    TEST_ASSERT(first && strstr(first + 1, "<|observation|>") == NULL);
+    free(p);
+    chat_msgs_free(&msgs);
+}
+
+static void test_glm_render_tools_block(void) {
+    chat_msgs msgs = {0};
+    chat_msg u = {0}; u.role = xstrdup("user"); u.content = xstrdup("go");
+    chat_msgs_push(&msgs, u);
+    char *p = render_chat_prompt_text_glm(&msgs, "{\"name\":\"bash\"}", DS4_THINK_NONE);
+    TEST_ASSERT(strstr(p, "<tools>\n{\"name\":\"bash\"}\n</tools>") != NULL);
+    TEST_ASSERT(strstr(p, "<tool_call>{function-name}") != NULL);
+    free(p);
+    chat_msgs_free(&msgs);
+}
+
+static void test_glm_tool_call_render_from_json(void) {
+    tool_calls calls = {0};
+    tool_call tc = {.name = xstrdup("read"),
+                    .arguments = xstrdup("{\"path\":\"/tmp/x\",\"n\":5}")};
+    tool_calls_push(&calls, tc);
+    buf b = {0};
+    append_glm_tool_calls_text(&b, &calls);
+    /* String arg verbatim, numeric arg as JSON. */
+    TEST_ASSERT(!strcmp(b.ptr,
+        "<tool_call>read<arg_key>path</arg_key><arg_value>/tmp/x</arg_value>"
+        "<arg_key>n</arg_key><arg_value>5</arg_value></tool_call>"));
+    buf_free(&b);
+    tool_calls_free(&calls);
+}
+
+static void test_glm_tool_call_parse_roundtrip(void) {
+    const char *text = "Let me check.<tool_call>read<arg_key>path</arg_key>"
+                       "<arg_value>/tmp/x</arg_value></tool_call>";
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_glm(text, text, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(!strcmp(calls.v[0].name, "read"));
+    TEST_ASSERT(!strcmp(calls.v[0].arguments, "{\"path\": \"/tmp/x\"}"));
+    TEST_ASSERT(content && !strcmp(content, "Let me check."));
+    TEST_ASSERT(calls.raw_dsml != NULL);
+    /* The captured raw block re-renders byte-identically (cache-key stable). */
+    buf b = {0};
+    append_glm_tool_calls_text(&b, &calls);
+    TEST_ASSERT(!strcmp(b.ptr, calls.raw_dsml));
+    buf_free(&b);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_glm_tool_call_parse_types_and_multi(void) {
+    const char *text =
+        "<tool_call>f<arg_key>s</arg_key><arg_value>hello world</arg_value>"
+        "<arg_key>n</arg_key><arg_value>42</arg_value>"
+        "<arg_key>b</arg_key><arg_value>true</arg_value></tool_call>"
+        "<tool_call>g<arg_key>x</arg_key><arg_value>[1,2]</arg_value></tool_call>";
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_glm(text, text, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 2);
+    TEST_ASSERT(!strcmp(calls.v[0].name, "f"));
+    TEST_ASSERT(!strcmp(calls.v[0].arguments,
+        "{\"s\": \"hello world\", \"n\": 42, \"b\": true}"));
+    TEST_ASSERT(!strcmp(calls.v[1].name, "g"));
+    TEST_ASSERT(!strcmp(calls.v[1].arguments, "{\"x\": [1,2]}"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_glm_parse_reasoning_and_plain(void) {
+    const char *t1 = "<think>thinking deeply</think>Final answer.";
+    char *c = NULL, *r = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_glm(t1, t1, &c, &r, &calls));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(r && !strcmp(r, "thinking deeply"));
+    TEST_ASSERT(c && !strcmp(c, "Final answer."));
+    free(c);
+    free(r);
+    tool_calls_free(&calls);
+
+    const char *t2 = "just text";
+    c = NULL; r = NULL;
+    tool_calls calls2 = {0};
+    TEST_ASSERT(parse_generated_message_glm(t2, t2, &c, &r, &calls2));
+    TEST_ASSERT(calls2.len == 0);
+    TEST_ASSERT(c && !strcmp(c, "just text"));
+    TEST_ASSERT(r == NULL);
+    free(c);
+    free(r);
+    tool_calls_free(&calls2);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
@@ -15766,6 +16191,14 @@ static void ds4_server_unit_tests_run(void) {
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
+    test_glm_render_basic_framing();
+    test_glm_render_drops_old_reasoning();
+    test_glm_render_system_and_tool_results();
+    test_glm_render_tools_block();
+    test_glm_tool_call_render_from_json();
+    test_glm_tool_call_parse_roundtrip();
+    test_glm_tool_call_parse_types_and_multi();
+    test_glm_parse_reasoning_and_plain();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
