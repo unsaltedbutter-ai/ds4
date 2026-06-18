@@ -27486,7 +27486,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
-        if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+        /* GLM has no Metal batch prefill; fall through to the sequential
+         * single-token extension loop below instead of the batch resume. */
+        if (suffix > 0 && (uint32_t)suffix >= resume_min &&
+            DS4_MODEL_VARIANT != DS4_VARIANT_GLM) {
             bool cancelled = false;
             ds4_sync_progress progress = {
                 .session = s,
@@ -27555,7 +27558,23 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
-    if (s->prefill_cap < (uint32_t)prompt->len) {
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM) {
+        /* No GLM-adapted Metal batch prefill yet (it SIGSEGVs on GLM's absent
+         * HC/compressor tensors); prefill by sequential decode, reusing the
+         * validated single-token forward while the raw KV accumulates.  Only the
+         * final token needs logits. */
+        ok = true;
+        for (int i = 0; ok && i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            float *step_logits = (i + 1 == prompt->len) ? s->logits : NULL;
+            ok = metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                                (uint32_t)prompt->v[i], (uint32_t)i, step_logits);
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+        }
+    } else if (s->prefill_cap < (uint32_t)prompt->len) {
         bool cancelled = false;
         ds4_sync_progress progress = {
             .session = s,
