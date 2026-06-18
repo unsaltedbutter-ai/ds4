@@ -1665,11 +1665,15 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return 1;
     }
-    /* GLM samples its quantized tail badly at top_p 1.0 (no nucleus filter); fall
-     * back to GLM's recommended 0.95 unless the user passed --top-p.  Config parse
-     * runs before model load, so detect the untouched ds4 default by value. */
+    /* GLM-Q2 degenerates at the ds4 defaults (top_p 1.0 = no nucleus filter,
+     * temp 1.0 = too hot for 2-bit); fall back to GLM's tuned 0.6 / 0.95 unless
+     * the user set them.  Config parse runs before model load, so detect the
+     * untouched ds4 defaults by value. */
     if (ds4_is_glm() && cfg.gen.top_p == DS4_DEFAULT_TOP_P) {
         cfg.gen.top_p = DS4_GLM_DEFAULT_TOP_P;
+    }
+    if (ds4_is_glm() && cfg.gen.temperature == DS4_DEFAULT_TEMPERATURE) {
+        cfg.gen.temperature = DS4_GLM_DEFAULT_TEMPERATURE;
     }
     if (cfg.dist && cfg.dist->role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options dist_gen = {

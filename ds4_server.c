@@ -764,7 +764,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->model = xstrdup("deepseek-v4-flash");
     r->max_tokens = max_tokens;
     r->top_k = 0;
-    r->temperature = DS4_DEFAULT_TEMPERATURE;
+    r->temperature = ds4_is_glm() ? DS4_GLM_DEFAULT_TEMPERATURE : DS4_DEFAULT_TEMPERATURE;
     r->top_p = ds4_is_glm() ? DS4_GLM_DEFAULT_TOP_P : DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
     r->think_mode = DS4_THINK_HIGH;
@@ -10659,7 +10659,7 @@ decode_again:
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
         if (ds4_think_mode_enabled(j->req.think_mode)) {
-            temperature = DS4_DEFAULT_TEMPERATURE;
+            temperature = ds4_is_glm() ? DS4_GLM_DEFAULT_TEMPERATURE : DS4_DEFAULT_TEMPERATURE;
             top_k = 0;
             top_p = ds4_is_glm() ? DS4_GLM_DEFAULT_TOP_P : DS4_DEFAULT_TOP_P;
             min_p = DS4_DEFAULT_MIN_P;
