@@ -163,6 +163,14 @@ bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 uint32_t ds4_think_max_min_context(void);
+
+/* Active model variant is GLM-5.2.  The server uses this to pick GLM chat
+ * framing and the <tool_call> format without reaching into tensor internals. */
+bool ds4_is_glm(void);
+/* GLM <|system|> reasoning-effort directive for the prompt head, or NULL when
+ * thinking is off (no block emitted).  Single source of truth shared with the
+ * token-level chat encoder. */
+const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
  * the GGUF so Flash/Pro dimensions are known. */

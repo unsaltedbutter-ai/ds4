@@ -23910,6 +23910,19 @@ const char *ds4_think_max_prefix(void) {
     return DS4_REASONING_EFFORT_MAX_PREFIX;
 }
 
+bool ds4_is_glm(void) {
+    return DS4_MODEL_VARIANT == DS4_VARIANT_GLM;
+}
+
+const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_HIGH: return DS4_GLM_REASONING_EFFORT_HIGH;
+    case DS4_THINK_MAX:  return DS4_GLM_REASONING_EFFORT_MAX;
+    case DS4_THINK_NONE: break;
+    }
+    return NULL;
+}
+
 uint32_t ds4_think_max_min_context(void) {
     return DS4_THINK_MAX_MIN_CONTEXT;
 }
