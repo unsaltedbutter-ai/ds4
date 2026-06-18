@@ -1,0 +1,75 @@
+Held-out perplexity corpus for comparing GLM-5.2 Q2 quantization variants. This text is
+deliberately kept separate from any imatrix calibration set so that perplexity here measures
+generalization rather than memorization. Only the relative ranking of avg_nll across variants
+is meaningful; the absolute value depends on the text and the tokenizer.
+
+The history of cartography traces the slow refinement of how people picture the world. Early
+Babylonian clay tablets placed a ring of water around a flat disc of land, while Greek thinkers
+such as Eratosthenes reasoned from the angle of shadows at noon that the Earth was a sphere, and
+he estimated its circumference with surprising accuracy. Ptolemy gathered the geographic
+knowledge of the classical world into a single treatise, assigning coordinates to thousands of
+places and arguing that a curved surface could be projected onto a flat sheet only at the cost of
+some distortion. That insight still governs every map: a projection must trade away faithful area,
+faithful angle, or faithful distance, because no flat depiction can preserve all three at once.
+The Mercator projection, designed for navigation, keeps angles true so that a constant compass
+bearing appears as a straight line, but it badly inflates the apparent size of land near the
+poles, which is why Greenland can look as large as Africa even though Africa is roughly fourteen
+times bigger.
+
+In biology, the cell is the smallest unit that can be called alive, and the boundary between a
+cell and its surroundings is a thin membrane built from two layers of fatty molecules. Embedded in
+that membrane are proteins that act as gates, pumps, and sensors, letting the cell admit nutrients,
+expel waste, and listen for chemical signals from its neighbors. Inside a typical animal cell, the
+nucleus stores the genome as long threads of DNA wound around protein spools, while mitochondria,
+once free-living bacteria, now supply most of the chemical energy the cell spends. The instructions
+encoded in DNA are first copied into messenger RNA and then read by ribosomes, which assemble chains
+of amino acids in the order the message dictates. A single mistake in that order can fold a protein
+the wrong way, and a misfolded protein is at the root of several stubborn diseases.
+
+Economic exchange depends on trust as much as on goods. Before coins, communities relied on credit
+recorded in memory or on tally sticks, and a debt was simply a promise the village agreed to honor.
+Coins made of precious metal let strangers trade without that shared memory, because the metal
+carried value anyone could weigh. Paper money went further, substituting a promise printed by a
+state for the metal itself, and modern digital balances are promises recorded in ledgers no one can
+hold. Each step widened the circle of people who could trade, but each also concentrated risk: when
+the institution behind the promise falters, the value it once guaranteed can evaporate quickly, and
+panics spread faster than the underlying facts.
+
+Consider a short programming problem. Suppose you are given a list of integers and asked to find the
+length of the longest run of strictly increasing values. A direct approach walks the list once,
+keeping two counters: the length of the current increasing run and the best length seen so far.
+Whenever the next value exceeds the previous one, the current run grows by one; otherwise the run
+resets to a single element. After each step you update the best length if the current run is longer.
+This runs in linear time and uses constant extra space, which is the kind of tradeoff worth naming
+explicitly when you explain the solution to someone else.
+
+Weather and climate are often confused, yet they describe different things. Weather is the state of
+the atmosphere over hours or days, the rain on a particular afternoon or the cold of a single night.
+Climate is the statistical summary of weather over decades, the distribution from which any given
+day is drawn. A region can have a warming climate and still suffer an unusually cold winter, just as
+a loaded die can still occasionally show a low number. Because the two operate on such different
+timescales, a single storm proves little about long-term trends, and a single warm decade is only
+suggestive until the pattern repeats across many places and many years.
+
+The development of writing transformed human memory. Speech vanishes the instant it is spoken, but a
+mark pressed into clay or brushed onto paper outlasts the person who made it. The earliest scripts
+were not poetry but accounting: lists of grain, livestock, and labor owed. Only later did writing
+stretch to capture law, story, and argument. Once ideas could be fixed in a durable form, they could
+travel across distance and time without a living speaker to carry them, and a reader centuries away
+could disagree with an author long dead. In this sense every library is a conversation that refuses
+to end, with each generation adding replies the previous one will never read.
+
+Light behaves in ways that resist common intuition. It travels as a wave, bending around edges and
+interfering with itself to produce bright and dark bands, yet it also arrives in discrete packets of
+energy called photons, which is why a dim enough beam registers as individual clicks rather than a
+smooth glow. The color we perceive corresponds to the wavelength of the wave, and the energy of each
+photon rises as the wavelength shrinks, so blue light carries more energy per photon than red. When
+sunlight passes through a raindrop it is bent and split into its component colors, and the geometry of
+that bending is why a rainbow always appears at a fixed angle away from the point directly opposite
+the sun, arching higher when the sun sits low and flattening when the sun climbs.
+
+Good explanations share a few habits. They state what is being claimed before piling on detail, they
+name the assumptions they rely on, and they point out where the argument is weakest rather than hiding
+it. A claim that cannot fail any test explains nothing, because it forbids no outcome. The most useful
+descriptions of the world are therefore the ones that stick their necks out, predicting that some
+things will happen and others will not, and then surviving the attempt to prove them wrong.
