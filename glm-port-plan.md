@@ -553,6 +553,23 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-17 (**Q4 quality cross-check attempted -> found GLM SSD streaming is unimplemented; output
+  glitches are Q2/greedy, not engine bugs**): Tried to run Q4 (408.7 GiB, streaming-only on 256 GB) to
+  prove the Q2 generation glitches are quantization, not a code bug. **Q4 streaming is blocked**: the
+  streaming decode-span builder (`model_map_span_vec_include_layer_decode`) only listed DeepSeek's
+  tensors, so a streamed GLM layer hit `attn_output`/dense FFN ranges "not covered by mapped model
+  views" (o_proj failed at layer 0). Added GLM's `attn_output` + `ffn_*_dense` to the span set (correct,
+  kept) -> got to layer 64, then **OOM**: GLM has no routed-expert streaming (it reads experts via
+  `ds4_gpu_routed_moe_one_tensor` over the model map, not the DeepSeek evicting cache), and mapping all
+  408 GiB of experts can't fit. **Conclusion: GLM SSD streaming needs the proper selected-expert cache
+  (load the 8 routed experts/layer, evict cold) before Q4 can stream** -- a substantial follow-up;
+  reverted the map-all-experts stopgap. **On the glitches** (asked: are they Q2 or a bug?): the
+  evidence points to Q2 + greedy behavior, not engine bugs -- (a) at `--temp 0.05` (near-greedy) the
+  output is clean and correct, "Uranus" spelled in full; (b) the "Uran" truncation appeared only at
+  `--temp 0.7` (sampling the flatter Q2 tail), not under greedy; (c) ">5 planets returned" is the model
+  getting the 5 correct then over-generating (greedy doesn't stop) -- a stopping/instruction-following
+  weakness Q2 amplifies. A definitive Q4 comparison still needs GLM expert streaming. The kept span fix
+  (attn_output/dense) is a prerequisite for that work.
 - 2026-06-17 (**session/sampled prefill SIGSEGV fixed -- temp>0 + the server path now run**): The
   default CLI path (`temp>0` -> `run_sampled_generation`) and the server both prefill via
   `ds4_session_sync`, whose cold + resumed prefill called `metal_graph_prefill_layer_major` (the
