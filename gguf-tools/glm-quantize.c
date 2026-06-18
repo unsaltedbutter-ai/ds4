@@ -801,9 +801,21 @@ static void exp_range(int e0, int e1, void *c) {
     free(imat);
 }
 
-/* Routed-expert quant types: default Q4_K; --q2 sets IQ2_XXS gate/up + Q2_K down. */
+/* Routed-expert quant types: default Q4_K; --q2 sets IQ2_XXS gate/up + Q2_K down.
+ * --gu-type / --down-type override either independently for recipe sweeps. */
 static ds4q_type g_exp_gu_type = DS4Q_TYPE_Q4_K;
 static ds4q_type g_exp_down_type = DS4Q_TYPE_Q4_K;
+
+/* Map a CLI type name to a ds4q_type.  Only the types the converter can actually
+ * emit AND the engine has Metal MoE kernels for are accepted. */
+static ds4q_type parse_qtype(const char *s) {
+    if (!strcmp(s, "iq2_xxs")) return DS4Q_TYPE_IQ2_XXS;
+    if (!strcmp(s, "q2_k"))    return DS4Q_TYPE_Q2_K;
+    if (!strcmp(s, "q4_k"))    return DS4Q_TYPE_Q4_K;
+    if (!strcmp(s, "q8_0"))    return DS4Q_TYPE_Q8_0;
+    fprintf(stderr, "glm-quantize: unsupported expert type '%s' (have: iq2_xxs q2_k q4_k q8_0)\n", s);
+    exit(1);
+}
 
 static tplan *build_plan(int n_layers, int *count) {
     tplan *p = NULL; int n = 0, cap = 0;
@@ -1094,6 +1106,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--write-full") == 0 && i + 1 < argc) write_full = argv[++i];
         else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) n_layers = atoi(argv[++i]);
         else if (strcmp(argv[i], "--q2") == 0) { g_exp_gu_type = DS4Q_TYPE_IQ2_XXS; g_exp_down_type = DS4Q_TYPE_Q2_K; }
+        else if (strcmp(argv[i], "--gu-type") == 0 && i + 1 < argc) g_exp_gu_type = parse_qtype(argv[++i]);
+        else if (strcmp(argv[i], "--down-type") == 0 && i + 1 < argc) g_exp_down_type = parse_qtype(argv[++i]);
         else if (strcmp(argv[i], "--verify") == 0 && i + 1 < argc) verify_in = argv[++i];
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) usage();
