@@ -104,6 +104,7 @@ static id<MTLComputePipelineState> g_moe_mul_mv_slots6_q4_k_sum6_pipeline;
 /* GLM 8-expert streaming dispatch (optional; nil if the kernels fail to build). */
 static id<MTLComputePipelineState> g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_slots8_q4_k_sum8_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_slots8_q2_k_sum8_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline;
@@ -5647,6 +5648,20 @@ int ds4_gpu_init(void) {
             fprintf(stderr, "ds4: Metal slots8 sum8 unavailable (GLM Q4 streaming): %s\n",
                     error ? [[error localizedDescription] UTF8String] : "function not found");
         }
+        /* Q2_K down sum8: lets a Q4_K-gate/up + Q2_K-down model stream (the Q4_K sum8
+         * above misreads Q2_K down blocks).  Optional/non-fatal. */
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_slots8_q2_K_sum8_f32"
+                           constantValues:moe_mv_id_constants
+                                    error:&error];
+        if (fn) {
+            g_moe_mul_mv_slots8_q2_k_sum8_pipeline =
+                [g_device newComputePipelineStateWithFunction:fn error:&error];
+        }
+        if (!g_moe_mul_mv_slots8_q2_k_sum8_pipeline) {
+            fprintf(stderr, "ds4: Metal slots8 q2_K sum8 unavailable (GLM mixed Q4gu/Q2down streaming): %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "function not found");
+        }
 
         error = nil;
         fn = [library newFunctionWithName:@"kernel_q4_gather_slots6"];
@@ -6797,6 +6812,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_slots6_q4_k_sum6_pipeline = nil;
         g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_slots8_q4_k_sum8_pipeline = nil;
+        g_moe_mul_mv_slots8_q2_k_sum8_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_addr_q2_k_sum6_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline = nil;
@@ -25177,14 +25193,19 @@ int ds4_gpu_glm_streaming_routed_moe_tensor(
         uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x) {
+        const ds4_gpu_tensor *x,
+        uint32_t                down_type) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate_scratch || !up_scratch || !mid_scratch || !model_map ||
         !selected_ids || !weights || !x ||
         n_expert != 8 || n_total_expert == 0 ||
         gate_expert_bytes == 0 || down_expert_bytes == 0) return 0;
-    if (!g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline ||
-        !g_moe_mul_mv_slots8_q4_k_sum8_pipeline) return 0;
+    /* gate/up are always Q4_K on the streaming path (the caller gates on a Q4_K gate
+     * type); the down can be Q4_K (full Q4) or Q2_K (Q4-gate/up + cheap Q2_K down). */
+    id<MTLComputePipelineState> down_pipeline =
+        (down_type == DS4_METAL_TENSOR_Q2_K) ? g_moe_mul_mv_slots8_q2_k_sum8_pipeline
+                                             : g_moe_mul_mv_slots8_q4_k_sum8_pipeline;
+    if (!g_moe_mul_mv_slots8_q4_k_pair_swiglu_pipeline || !down_pipeline) return 0;
 
     @autoreleasepool {
         const uint64_t up_expert_bytes = gate_expert_bytes; /* up shares gate shape */
@@ -25235,9 +25256,11 @@ int ds4_gpu_glm_streaming_routed_moe_tensor(
         }
 
         const uint32_t n_tokens = 1;
-        const uint32_t nr0 = ds4_gpu_routed_mv_nr0(DS4_METAL_TENSOR_Q4_K);
+        const uint32_t nr0 = ds4_gpu_routed_mv_nr0(DS4_METAL_TENSOR_Q4_K);          /* gate/up (Q4_K) */
         const NSUInteger smem = ds4_gpu_routed_mv_smem(DS4_METAL_TENSOR_Q4_K);
-        if (nr0 == 0) return 0;
+        const uint32_t down_nr0 = ds4_gpu_routed_mv_nr0(down_type);                  /* down (Q4_K or Q2_K) */
+        const NSUInteger down_smem = ds4_gpu_routed_mv_smem(down_type);
+        if (nr0 == 0 || down_nr0 == 0) return 0;
 
         ds4_gpu_mul_mv_id_args gate_args =
             ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
@@ -25246,7 +25269,7 @@ int ds4_gpu_glm_streaming_routed_moe_tensor(
         ds4_gpu_mul_mv_id_args down_args =
             ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
                                         down_row_bytes, down_expert_bytes,
-                                        n_expert, n_expert, n_tokens, nr0);
+                                        n_expert, n_expert, n_tokens, down_nr0);
         ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
             .width = expert_mid_dim,
             .rows = n_tokens * n_expert,
@@ -25282,12 +25305,12 @@ int ds4_gpu_glm_streaming_routed_moe_tensor(
                 weightsbuf, ds4_gpu_tensor_offset(weights),
                 smem, 2, false) &&
             ds4_gpu_encode_mul_mv_slots8_sum8(cb,
-                g_moe_mul_mv_slots8_q4_k_sum8_pipeline,
+                down_pipeline,
                 &down_args,
                 down_bufs, down_offs,
                 midbuf, ds4_gpu_tensor_offset(mid_scratch),
                 outbuf, ds4_gpu_tensor_offset(out),
-                smem, 2);
+                down_smem, 2);
         if (!had_batch) {
             ok = ds4_gpu_end_commands() != 0 && ok;
         }

@@ -8696,12 +8696,13 @@ extern "C" int ds4_gpu_glm_streaming_routed_moe_tensor(
         uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x) {
+        const ds4_gpu_tensor *x,
+        uint32_t                down_type) {
     (void)out; (void)gate_scratch; (void)up_scratch; (void)mid_scratch; (void)model_map;
     (void)model_size; (void)gate_offset; (void)up_offset; (void)down_offset;
     (void)gate_expert_bytes; (void)gate_row_bytes; (void)down_expert_bytes; (void)down_row_bytes;
     (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim; (void)selected_ids; (void)weights;
-    (void)n_total_expert; (void)n_expert; (void)clamp; (void)x;
+    (void)n_total_expert; (void)n_expert; (void)clamp; (void)x; (void)down_type;
     fprintf(stderr, "ds4: GLM Q4 streaming MoE is not supported on the CUDA backend\n");
     return 0;
 }

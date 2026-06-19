@@ -15223,7 +15223,8 @@ static bool metal_graph_glm_streaming_routed_moe(
         down_expert_bytes, down_row_bytes,
         (uint32_t)expert_in_dim, (uint32_t)expert_mid_dim, (uint32_t)routed_out_dim,
         selected_i32, g->router_weights,
-        DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+        DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
+        (uint32_t)layer->ffn_down_exps->type) != 0;
 }
 
 /* GLM-5.2 single-token decode layer.  GLM has no Hyper-Connections (single

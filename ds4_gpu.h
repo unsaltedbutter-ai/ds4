@@ -893,7 +893,8 @@ int ds4_gpu_glm_streaming_routed_moe_tensor(
         uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x);
+        const ds4_gpu_tensor *x,
+        uint32_t                down_type);
 
 /* True when GLM Q4 GPU streaming (slots8 Q4_K kernels) is available. */
 int ds4_gpu_q4_streaming_available(void);

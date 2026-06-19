@@ -3788,6 +3788,118 @@ kernel void kernel_mul_mv_slots8_q4_K_sum8_f32(
     (void)tgpig;
 }
 
+/* 8-expert Q2_K down-projection sum, for GLM Q4-gate/up + Q2_K-down streaming.  Exact
+ * clone of kernel_mul_mv_slots6_q2_K_sum6_f32 widened to 8 experts (the streaming pair_swiglu
+ * already route-weights the mid, so this just sums (mid . down) across the 8 selected experts).
+ * Lets a model with Q4_K gate/up but a cheaper Q2_K down stream correctly (the Q4_K sum8 kernel
+ * would misread the Q2_K blocks). */
+kernel void kernel_mul_mv_slots8_q2_K_sum8_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src00,
+        device const char * src01,
+        device const char * src02,
+        device const char * src03,
+        device const char * src04,
+        device const char * src05,
+        device const char * src06,
+        device const char * src07,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const short nr0 = N_R0_Q2_K;
+    const int nb = args.ne00 / QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const uint token = tgpig.y;
+    device const char *token_src1 = src1 + (uint64_t)token * args.nb12;
+
+    float sumf[nr0] = {0.f};
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const short is = (8 * ir) / 16;
+
+    for (int expert_slot = 0; expert_slot < 8; expert_slot++) {
+        device const char *src0_cur = src00;
+        switch (expert_slot) {
+        case 1: src0_cur = src01; break;
+        case 2: src0_cur = src02; break;
+        case 3: src0_cur = src03; break;
+        case 4: src0_cur = src04; break;
+        case 5: src0_cur = src05; break;
+        case 6: src0_cur = src06; break;
+        case 7: src0_cur = src07; break;
+        default: break;
+        }
+        device const block_q2_K *x =
+            (device const block_q2_K *)(src0_cur + first_row * args.nb01);
+        device const float *y = (device const float *)(token_src1 + expert_slot * args.nb11);
+        device const float *y4 = y + ix * QK_K + 128 * iq + 8 * ir;
+
+        for (int ib = ix; ib < nb; ib += 4) {
+            float yl[32];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (short i = 0; i < 8; ++i) {
+                yl[i +  0] = y4[i +  0]; sumy[0] += yl[i +  0];
+                yl[i +  8] = y4[i + 32]; sumy[1] += yl[i +  8];
+                yl[i + 16] = y4[i + 64]; sumy[2] += yl[i + 16];
+                yl[i + 24] = y4[i + 96]; sumy[3] += yl[i + 24];
+            }
+
+            device const uint8_t  *sc = (device const uint8_t *)x[ib].scales + 8 * iq + is;
+            device const uint16_t *qs = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+            device const half     *dh = &x[ib].d;
+
+            for (short row = 0; row < nr0; row++) {
+                if (first_row + row < args.ne0) {
+                    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                    for (int i = 0; i < 8; i += 2) {
+                        acc1[0] += yl[i +  0] * (qs[i / 2] & 0x0003);
+                        acc2[0] += yl[i +  1] * (qs[i / 2] & 0x0300);
+                        acc1[1] += yl[i +  8] * (qs[i / 2] & 0x000c);
+                        acc2[1] += yl[i +  9] * (qs[i / 2] & 0x0c00);
+                        acc1[2] += yl[i + 16] * (qs[i / 2] & 0x0030);
+                        acc2[2] += yl[i + 17] * (qs[i / 2] & 0x3000);
+                        acc1[3] += yl[i + 24] * (qs[i / 2] & 0x00c0);
+                        acc2[3] += yl[i + 25] * (qs[i / 2] & 0xc000);
+                    }
+                    float dall = dh[0];
+                    float dmin = dh[1] * 1.f / 16.f;
+                    sumf[row] += dall * ((acc1[0] + 1.f / 256.f * acc2[0]) * (sc[0] & 0xF) * 1.f /  1.f +
+                                         (acc1[1] + 1.f / 256.f * acc2[1]) * (sc[2] & 0xF) * 1.f /  4.f +
+                                         (acc1[2] + 1.f / 256.f * acc2[2]) * (sc[4] & 0xF) * 1.f / 16.f +
+                                         (acc1[3] + 1.f / 256.f * acc2[3]) * (sc[6] & 0xF) * 1.f / 64.f) -
+                                 dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) +
+                                         sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0));
+                }
+
+                qs += args.nb01 / 2;
+                sc += args.nb01;
+                dh += args.nb01 / 2;
+            }
+
+            y4 += 4 * QK_K;
+        }
+    }
+
+    device float *dst_f32 = (device float *)(dst + (uint64_t)token * args.nb1);
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; row++) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) dst_f32[first_row + row] = sum_all;
+    }
+
+    (void)shmem;
+    (void)tiitg;
+    (void)tgpig;
+}
+
 kernel void kernel_mul_mv_group6_q4_K_sum6_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src00,
