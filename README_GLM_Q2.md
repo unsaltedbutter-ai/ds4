@@ -15,11 +15,12 @@ Q4 (≈409 GiB) cannot be resident on 256 GB and is disk-bound (~0.76 tok/s); Q2
 >   fact about each*" it actually produces the facts (Mercury smallest/no moons, Venus hottest,
 >   Jupiter largest). Every Q2 recipe fails this — they loop on the list and emit no fact. If
 >   quality is paramount and tok/s is acceptable (you said it is), use Q4.
-> - **Best resident/fast → `glm-5.2-q2-imatrix-dense.gguf`** (219 GiB, ~11 t/s). IQ2_XXS gate/up
->   weighted by a real 20k-token activation imatrix: clean and correct on *simple* prompts (greedy
->   gives a correct planet list where the original Q2 loops on "Mercury"), but it cannot do complex
->   prompts — the **2-bit IQ2_XXS gate/up ceiling**, which no Q2 recipe (denser imatrix, down→Q4_K)
->   lifts; only Q4-level gate/up does.
+> - **Best resident/fast → `glm-5.2-q2.gguf`** (219 GiB, ~11 t/s). This canonical name now ships the
+>   **imatrix-weighted** Q2 (the original synthetic-importance baseline was promoted out and deleted):
+>   IQ2_XXS gate/up weighted by a real 20k-token activation imatrix. Clean and correct on *simple*
+>   prompts (greedy gives a correct planet list where the old Q2 looped on "Mercury"), but it cannot
+>   do complex prompts — the **2-bit IQ2_XXS gate/up ceiling**, which no Q2 recipe (denser imatrix,
+>   down→Q4_K) lifts; only Q4-level gate/up does. Reproduce via `scripts/glm-imatrix-iterate.sh`.
 >
 > **Why not the others:** a 2-bit Q2 (any recipe, ours or external) hits the same complex-prompt
 > ceiling. External HuggingFace GGUFs (unsloth UD-IQ2, REAP50 Q2/Q3) **don't load in ds4** (glm-dsa
@@ -30,6 +31,13 @@ Q4 (≈409 GiB) cannot be resident on 256 GB and is disk-bound (~0.76 tok/s); Q2
 ---
 
 ## 1. How the current Q2 was created
+
+> **Note (post-campaign):** §1 describes the **original** Q2 recipe (synthetic importance), which was
+> the shipping `glm-5.2-q2.gguf` through the campaign. As of 2026-06-18 the canonical
+> `glm-5.2-q2.gguf` is the **imatrix-weighted** build (§5): identical recipe except IQ2_XXS gate/up
+> is weighted by a real 20k-token activation imatrix. Everything in §1 still describes the layout;
+> only the gate/up importance source changed. Rebuild either via `scripts/glm-imatrix-iterate.sh`
+> (imatrix) or `scripts/glm-q2-build.sh OUT.gguf` (synthetic).
 
 ### 1.1 One direct pass: bf16 → f32 → 2-bit. There is **no** Q8 intermediate.
 
@@ -391,7 +399,10 @@ write artifacts to `/Volumes/4TB-1`. Launch each detached (`( nohup bash … & )
   the list. Q4 still over-generates/repeats after the first pass (greedy-not-stopping, fixable with a
   stop + sampling), but the *content* clears the 2-bit ceiling. **Final recommendation:** Q4 for
   quality (speed acceptable per user), imatrix-dense Q2 for resident speed. Deleted the superseded
-  inferior variants (1399-tok imatrix, down4) after capturing their benchmarks here.
+  inferior variants (1399-tok imatrix, down4) after capturing their benchmarks here. **File cleanup:**
+  also deleted the synthetic-importance baseline and **promoted the 20k-token imatrix build to the
+  canonical `glm-5.2-q2.gguf`** (default Q2 name = best Q2). Remaining: `glm-5.2-q2.gguf` (best Q2) and
+  `glm-5.2-q4.gguf` (best quality); 1.4 TiB free on /Volumes/4TB-1.
 - **2026-06-18 — external off-the-shelf GGUFs surveyed; none beats our Q4 for quality, none loads
   in ds4.** Checked three HuggingFace GLM-5.2 GGUFs (user request): `unsloth/GLM-5.2-GGUF`
   (UD-IQ2_XXS 238 GB / UD-IQ2_M 239 GB, full 256 experts), `pipenetwork/GLM-5.2-REAP50-Q2_K`
