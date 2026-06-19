@@ -577,6 +577,25 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-18 (**Q2 IMPROVEMENT CAMPAIGN — real activation imatrix is a clear resident-Q2 win; full
+  detail in `README_GLM_Q2.md`**): Ran an autonomous experiment campaign to improve Q2. **(1) Eval
+  metric:** built `--perplexity-file` but found raw-prose ppl is uninformative for GLM (Q4 3079 ≈ Q2
+  3184 — the reasoning model is OOD on un-framed prose, masking the quant signal); pivoted to the
+  greedy/behavioral battery. **(2) Option A (real imatrix) — the win:** the imatrix collector hooked
+  the GLM-unadapted batch prefill (SIGSEGV), so re-pointed it at GLM **sequential decode**; a per-layer
+  post-MoE GPU read exhausted the Metal command-buffer pool (~layer 44), so collect **gate/up importance
+  inside the CPU router** (one already-present read/layer) and let the converter fall back to synthetic
+  for down. New: converter `--imatrix`/`--gu-type`/`--down-type`/`--q4-layers` flags; `ds4_engine_collect_imatrix`
+  GLM path; `imatrix_accum_gate_up` + `imatrix_collector_save` omits zero-count entries. Collected a
+  20k-token / 12M-observation imatrix and rebuilt: **`glm-5.2-q2-imatrix-dense.gguf` (219 GiB, resident,
+  ~11 t/s) is the recommended Q2** — greedy gives a clean correct planet list where baseline loops on
+  "Mercury". **(3) Ceiling:** long/complex prompts still degenerate; down→Q4_K (272 GiB, streamed ~0.65
+  t/s) only marginally helps → the bottleneck is the **2-bit IQ2_XXS gate/up** (gate/up can only be
+  IQ2_XXS or Q4_K — no Q2_K pair_swiglu kernel), fixable only by Q4-level gate/up (full Q4, or `--q4-layers`
+  on a few sensitive layers — landed, untested). A0 (synthetic down-weighting) was dropped as subsumed.
+  All engine changes variant-gated (DeepSeek path untouched; no new public GPU entry → no CUDA stub).
+  Reusable scripts in `scripts/` (build/eval/collect/iterate, all trap-protected). DeepSeek prod (8085)
+  stopped/restarted many times via the trap pattern; left UP.
 - 2026-06-18 (**Q2 characterized + documented; better-Q2 options + test plan written → `README_GLM_Q2.md`**):
   Per user, ran the current Q2 and documented what works/doesn't, how it was built, and how to make it
   better. **Run** (5-prompt battery on notible via a trap-protected detached script `scripts/glm-q2-characterize.sh`;
