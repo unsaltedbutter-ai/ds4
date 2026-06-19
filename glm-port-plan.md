@@ -577,6 +577,22 @@ stayed within mmap/CPU-light bounds.
 
 ## 6. Status log
 
+- 2026-06-19 (**Q2 campaign finale — all levers tested; two tiers, no usable third; mixed-precision
+  streaming fix landed**): Tested the remaining quality levers (`README_GLM_Q2.md` §4.4/§5 for detail).
+  **`--q4-layers`** (lift selected layers' gate/up to Q4_K): resident partials (≤~12 layers, e.g.
+  last8 at 234 GiB / 11.4 t/s) run but don't clear the hard prompt; bigger configs are too big for
+  resident. **Found + fixed a streaming bug:** the slots8 streaming kernels were Q4_K-only, so a
+  Q4-gate/up + Q2_K-down model garbled — added `kernel_mul_mv_slots8_q2_K_sum8_f32` (slots6_q2_K_sum6
+  widened to 8) + a `down_type` arg to `ds4_gpu_glm_streaming_routed_moe_tensor` (full-Q4 path
+  unchanged; CUDA stub/header updated). With the fix, **q4gu-all (Q4 gate/up + Q2_K down, 356 GiB)
+  runs and reaches Q4-class quality** (produces the planet facts) → **gate/up is the quality driver**.
+  But it does NOT beat Q4: terser facts (Q2_K down) and ~same disk-bound ~1 t/s (only 13% smaller).
+  **External HF GGUFs** (unsloth UD-IQ2, REAP50 Q2/Q3) surveyed: glm-dsa / patched-llama.cpp-only
+  (ds4 can't load them), REAP50 is expert-pruned + degraded — none higher quality than our Q4.
+  **Outcome: `glm-5.2-q2.gguf` (now the imatrix build, 219 GiB resident ~11 t/s, simple prompts) and
+  `glm-5.2-q4.gguf` (409 GiB streamed ~1 t/s, complex prompts) are the two tiers; no usable middle.**
+  Converter gained `--gu-type/--down-type/--q4-layers`; inferior variants deleted (benchmarks in the
+  README). DeepSeek path untouched; DeepSeek prod (8085) cycled via the trap pattern, left UP.
 - 2026-06-18 (**Q2 IMPROVEMENT CAMPAIGN — real activation imatrix is a clear resident-Q2 win; full
   detail in `README_GLM_Q2.md`**): Ran an autonomous experiment campaign to improve Q2. **(1) Eval
   metric:** built `--perplexity-file` but found raw-prose ppl is uninformative for GLM (Q4 3079 ≈ Q2

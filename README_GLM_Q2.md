@@ -28,8 +28,11 @@ Q4 (≈409 GiB) cannot be resident on 256 GB and is disk-bound (~0.76 tok/s); Q2
 > garble a model whose down is still Q2_K). The only thing that streams correctly with Q4 gate/up is
 > *uniform* Q4_K — i.e. full Q4. External HuggingFace GGUFs (unsloth UD-IQ2, REAP50 Q2/Q3) **don't
 > load in ds4** (glm-dsa, patched-llama.cpp-only) and aren't higher quality (REAP50 is pruned +
-> degraded; unsloth is 2-bit). A faster-than-Q4 / near-Q4-quality middle tier (~356 GiB, ~3.5 t/s)
-> is *possible* but needs a streaming-path fix for non-uniform expert precision — see §5 follow-up.
+> degraded; unsloth is 2-bit). A middle tier (Q4 gate/up + Q2_K down, 356 GiB) was built and made
+> to stream via a new mixed-precision kernel (§5): it reaches **Q4-class quality** (it produces the
+> facts — gate/up is the quality driver) but **does not beat Q4** — terser facts (Q2_K down) and
+> ~the same disk-bound ~1 t/s, only 13% smaller. So the two tiers above are the answer; there is no
+> usable third tier on this hardware.
 
 ---
 
@@ -378,7 +381,7 @@ quantitative metric (TBD as candidates land).
 | 06-18 | A (imatrix, gate/up, 1399-tok calib) | 218.9 GiB | resident | ~11 | 8.67 (noise) | — | short greedy lists all 5 planets (baseline looped on "Mercury") | clear win vs baseline; dense is a bit cleaner |
 | 06-18 | down4 (imatrix gate/up + **down Q4_K**) | 272 GiB | **streaming ~0.3 t/s** | 0.3 | — | — | short: lists 5; long: enumerates but still repeats/no facts | **not worth it** — more down bits don't lift the gate/up 2-bit ceiling; 35x slower for a marginal long-prompt gain |
 | 06-19 | q4gu-last8 (last 8 layers' gate/up → Q4_K + imatrix) | 234 GiB | **resident ~11.4 t/s** | 11.4 | — | — | short: correct list; long: lists, **no facts** (= imatrix-dense) | 8 Q4 layers insufficient; **broken under `--ssd-streaming`** (mixed expert sizes → garbage), so resident-only → capped at ~8–12 layers |
-| 06-19 | q4gu-all (all 75 layers' gate/up → Q4_K + imatrix, Q2_K down) | 356 GiB | streaming | (3.5) | — | — | **garbage (`!!!!`)** — never produced text | **unusable**: too big for resident; streaming slots8 kernels are **Q4_K-only** (gate/up AND down) and misread the Q2_K down. Couldn't be evaluated for quality |
+| 06-19 | q4gu-all (all gate/up → Q4_K + Q2_K down) **+ streaming fix** | 356 GiB | streaming | ~0.6–1.4 | — | — | **gives the facts** ("Mercury: closest to the Sun", "Venus: hottest") then over-generates | **Q4-class quality** (confirms gate/up drives quality) but **doesn't beat Q4**: terser facts (Q2_K down), ~same disk-bound speed, only 13% smaller. Needed a new `slots8_q2_K_sum8` kernel to stream at all |
 | 06-18 | A0 (down Q2_K weighted) | dropped | — | — | — | — | — | subsumed by A (real imatrix weights down too once collected) |
 
 ### 4.5 Running an iteration (notible)
@@ -404,6 +407,20 @@ write artifacts to `/Volumes/4TB-1`. Launch each detached (`( nohup bash … & )
 
 ## 5. Campaign log (newest first)
 
+- **2026-06-19 — streaming fix landed; q4gu-all is Q4-class quality but does NOT beat Q4.**
+  Implemented the mixed-precision streaming fix: a new `kernel_mul_mv_slots8_q2_K_sum8_f32`
+  (slots6_q2_K_sum6 widened to 8 experts) + threaded the down type through
+  `ds4_gpu_glm_streaming_routed_moe_tensor` so a **Q4_K gate/up + Q2_K down** model streams
+  correctly (gate/up stay Q4_K; full-Q4 down path unchanged; CUDA stub + header updated). With
+  the fix, **q4gu-all (356 GiB) runs coherently** and on the hard prompt **produces the facts**
+  ("Mercury: closest to the Sun", "Venus: hottest planet") — confirming **gate/up is the quality
+  driver** (down precision barely matters). **But it does not beat Q4:** the facts are terser than
+  Q4's (Q2_K down), the streaming speed is ~0.6–1.4 t/s (≈ Q4 — both disk-bound on the Q4_K
+  gate/up, so the cheaper down doesn't speed it up), and it's only 13% smaller. So Q4 dominates
+  (richer facts, similar speed). **Final outcome of the whole campaign: two tiers — imatrix-Q2
+  (219 GiB resident, ~11 t/s, simple prompts) and Q4 (409 GiB streamed, ~1 t/s, complex prompts);
+  no usable third tier.** The streaming fix is kept (it's a correct, general capability for
+  non-uniform expert precision) but yields no model that beats Q4. Deleted q4gu-all.
 - **2026-06-19 — `--q4-layers` sweep + a streaming bug found.** Testing the last untested lever
   (lift selected layers' gate/up to Q4_K on top of the imatrix). **Engine bug found:** a model with
   *mixed* expert sizes across layers (some Q4_K gate/up, some IQ2_XXS) is **broken under
