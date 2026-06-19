@@ -521,7 +521,39 @@ write artifacts to `/Volumes/4TB-1`. Launch each detached (`( nohup bash … & )
   `--gu-type/--down-type` flags and a prod-safe build runner. Launched **A0** (down Q2_K weighted)
   as the cheap first check; implementing the GLM imatrix collector (Option A) next.
 
-## 6. Pointers
+## 6. Benchmark: DeepSeek V4 Flash (prod) vs GLM-5.2 Q2/Q4 (2026-06-19)
+
+All three served via the same OpenAI API (`notible:8085`, `ds4-server`), same 5-prompt general
+battery (factual; factual+facts; math; code; transaction-categorization), `max_tokens` capped.
+DeepSeek V4 Flash is the resident **prod** model (`deepseek-v4-flash`, Q4); GLM Q2 is resident;
+GLM Q4 streams. Two rounds: **R1** = matched greedy (temp 0) + reasoning off; **R2** = temp 0.6 +
+reasoning=high (GLM's *recommended* serving mode). Scripts: `scripts/glm-vs-deepseek-bench.sh`,
+`glm-bench-round2.sh`, `glm-bench-client.py`.
+
+### Speed (decode tok/s — short prompts are latency-bound; long ones show true decode)
+| Model | R1 (greedy / reason off) | R2 (temp 0.6 / reason high) | stops cleanly? |
+|---|---|---|---|
+| **DeepSeek V4 Flash Q4** (resident, prod) | **~26–31** | **~27–29** | **yes** (finish=stop both rounds) |
+| GLM-5.2 Q2 (resident) | ~9–10 | ~9 | **no** — hit the token cap on *every* prompt |
+| GLM-5.2 Q4 (streaming) | ~0.4–0.9 | (≈ same) | no |
+
+### Quality (answer content)
+- **DeepSeek**: correct, complete, clean, and **terminates**. categorize → "Groceries"; planets with
+  rich correct facts ("Mercury – smallest, no atmosphere, 430°C"); math right; code right.
+- **GLM-5.2 Q2**: **degenerates in both modes** — R1 greedy gave a *wrong* "OTHER" + control-token
+  spam (`<|user|></think>…`); R2 (its recommended mode) thought briefly then spewed `</think>` and
+  never produced the answer or stopped. **Not production-viable on this box.**
+- **GLM-5.2 Q4**: best GLM quality — gives the facts (Mercury water-ice/no-moons) with minor errors +
+  repetition — but **~0.5 t/s streaming is impractical**, and greedy still doesn't stop.
+
+### Conclusion
+**DeepSeek V4 Flash Q4 dominates this box: ~3× faster than GLM-5.2 Q2, ~30–60× faster than GLM-5.2
+Q4, and the only one that reliably yields a clean, correct, *terminated* answer.** GLM-5.2 Q2 is
+both slower and degenerate; GLM-5.2 Q4 is higher quality but impractically slow. **There is no reason
+to switch from DeepSeek V4 Flash to GLM-5.2 for general serving here** — GLM-5.2's value would have to
+come from specific capabilities/context beyond this battery, not speed or general answer quality.
+
+## 7. Pointers
 
 - Converter: `gguf-tools/glm-quantize.c` (`--q2` at `:1089`, `build_plan` at `:801`,
   per-expert quant at `:770`, synthetic importance at `:783`).
