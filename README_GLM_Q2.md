@@ -337,12 +337,23 @@ quantitative metric (TBD as candidates land).
 |---|---|---|---|---|---|---|---|---|
 | 06-18 | **baseline** Q2 (IQ2_XXS g/u synth-imat, Q2_K down unweighted) | 218.9 GiB | resident | ~11.4 | 8.56 (1258 tok) / 8.07 (320 tok) | ref | loops (§2.3) | reference point |
 | 06-18 | _anchor_ Q4 (Q4_K experts) | 408.7 GiB | streaming | ~0.76 | **8.03** (320 tok) | — | coherent | Q4≈Q2 on prose → ppl uninformative (§4.1 note) |
-| 06-18 | A0 (down Q2_K weighted) | _building_ | resident | — | — | — | — | iter 1 |
+| 06-18 | **A (imatrix, gate/up, 1399-tok calib)** | 218.9 GiB | resident | ~11 | 8.67 (noise) | — | **short greedy now lists all 5 planets** (baseline looped on "Mercury") | **clear win on coherence**; long/sampled still degenerate |
+| 06-18 | A0 (down Q2_K weighted) | dropped | — | — | — | — | — | subsumed by A (real imatrix weights down too once collected) |
 
 ---
 
 ## 5. Campaign log (newest first)
 
+- **2026-06-18 — Option A result: the real imatrix improves Q2 coherence (clear win).**
+  Built `glm-5.2-q2-imatrix.gguf` (same recipe as baseline Q2 but IQ2_XXS gate/up weighted by
+  the real 1399-token activation imatrix; down stays synthetic). Same 219 GiB, resident, ~11 t/s.
+  **Greedy short prompt: it now lists all five planets correctly (Mercury→Jupiter); the baseline
+  loops on "Mercury" and never completes the list.** The long/complex prompt still degenerates
+  (preamble repetition) and sampled@0.6 still decoheres — the 2-bit ceiling on hard instructions
+  is not removed, but coherence on simpler prompts is clearly better. Prose ppl moved 8.56→8.67
+  (the wrong direction) — further confirmation that prose ppl is uninformative here; the behavior
+  is the real signal. **Next: a denser imatrix** (12k tokens from the 4700-block corpus) to push
+  the harder prompts; then promote the winner to `glm-5.2-q2.gguf`.
 - **2026-06-18 — Option A (real imatrix) built and collecting.** Implemented the full GLM
   imatrix path: converter `--imatrix` consumes a per-expert `.dat`; the engine collects via
   GLM **sequential decode** (the batch-prefill collector SIGSEGVs on GLM). First collector
