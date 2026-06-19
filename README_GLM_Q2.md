@@ -9,14 +9,23 @@ It is the Q2-quality companion to `README-GLM.md` (getting-started) and `glm-por
 (the port tracker). For why Q2 (not Q4) is the speed target, see `glm-port-plan.md` §4/§6:
 Q4 (≈409 GiB) cannot be resident on 256 GB and is disk-bound (~0.76 tok/s); Q2 fits.
 
-> **RECOMMENDATION (2026-06-18, after the improvement campaign):** the best resident Q2 is
-> **`/Volumes/4TB-1/glm-5.2-q2-imatrix-dense.gguf`** — same 219 GiB / resident / ~11 t/s as the
-> original Q2, but its IQ2_XXS gate/up experts are weighted by a **real 20k-token activation
-> imatrix** instead of a synthetic proxy. It is clearly more coherent on simpler prompts (greedy
-> gives a clean correct planet list where the original loops on "Mercury"). Complex/long prompts
-> still degenerate — that is the **2-bit IQ2_XXS gate/up ceiling**, which neither a denser imatrix
-> nor down→Q4_K fixes; only Q4-level gate/up does (use the streamed Q4, or `--q4-layers` to lift a
-> few sensitive layers' gate/up to Q4). See §5 for the full campaign and §1/§3 for how/why.
+> **RECOMMENDATION (2026-06-18, after the improvement campaign).** Two tiers, pick by priority:
+> - **Best quality → `glm-5.2-q4.gguf`** (408.7 GiB, full 256 experts Q4_K, streamed ~1.1 t/s).
+>   It is the **only** build that completes a complex instruction: on "list 5 planets *and give a
+>   fact about each*" it actually produces the facts (Mercury smallest/no moons, Venus hottest,
+>   Jupiter largest). Every Q2 recipe fails this — they loop on the list and emit no fact. If
+>   quality is paramount and tok/s is acceptable (you said it is), use Q4.
+> - **Best resident/fast → `glm-5.2-q2-imatrix-dense.gguf`** (219 GiB, ~11 t/s). IQ2_XXS gate/up
+>   weighted by a real 20k-token activation imatrix: clean and correct on *simple* prompts (greedy
+>   gives a correct planet list where the original Q2 loops on "Mercury"), but it cannot do complex
+>   prompts — the **2-bit IQ2_XXS gate/up ceiling**, which no Q2 recipe (denser imatrix, down→Q4_K)
+>   lifts; only Q4-level gate/up does.
+>
+> **Why not the others:** a 2-bit Q2 (any recipe, ours or external) hits the same complex-prompt
+> ceiling. External HuggingFace GGUFs (unsloth UD-IQ2, REAP50 Q2/Q3) **don't load in ds4** (glm-dsa
+> format, patched-llama.cpp-only) and aren't higher quality (REAP50 is expert-pruned + degraded;
+> unsloth is 2-bit). `--q4-layers` (lift a few layers' gate/up to Q4) is a built-but-untested
+> middle option if you want better-than-Q2 quality at faster-than-Q4 speed.
 
 ---
 
@@ -345,7 +354,7 @@ quantitative metric (TBD as candidates land).
 | Date | Variant | Size | Fit | tok/s | prose avg_nll | greedy-vs-Q4 | Battery | Notes |
 |---|---|---|---|---|---|---|---|---|
 | 06-18 | **baseline** Q2 (IQ2_XXS g/u synth-imat, Q2_K down unweighted) | 218.9 GiB | resident | ~11.4 | 8.56 (1258 tok) / 8.07 (320 tok) | ref | loops (§2.3) | reference point |
-| 06-18 | _anchor_ Q4 (Q4_K experts) | 408.7 GiB | streaming | ~0.76 | **8.03** (320 tok) | — | coherent | Q4≈Q2 on prose → ppl uninformative (§4.1 note) |
+| 06-18 | **Q4 (Q4_K experts, full 256)** | 408.7 GiB | streaming | ~1.08 | 8.03 (noise) | ref | **clears the hard prompt: lists 5 AND gives the facts** (Mercury smallest/no moons, Venus hottest, Jupiter largest) | **best quality** — the only build that does the complex task; no Q2 recipe produces any fact |
 | 06-18 | **A-dense (imatrix gate/up, 20k-tok calib)** | 218.9 GiB | resident | ~11 | 8.73 (noise) | — | **short greedy: clean correct numbered list 1–5 (repeated cleanly)** — best Q2 | **recommended Q2**; long/complex still degenerates (gate/up 2-bit ceiling) |
 | 06-18 | A (imatrix, gate/up, 1399-tok calib) | 218.9 GiB | resident | ~11 | 8.67 (noise) | — | short greedy lists all 5 planets (baseline looped on "Mercury") | clear win vs baseline; dense is a bit cleaner |
 | 06-18 | down4 (imatrix gate/up + **down Q4_K**) | 272 GiB | **streaming ~0.3 t/s** | 0.3 | — | — | short: lists 5; long: enumerates but still repeats/no facts | **not worth it** — more down bits don't lift the gate/up 2-bit ceiling; 35x slower for a marginal long-prompt gain |
@@ -374,6 +383,15 @@ write artifacts to `/Volumes/4TB-1`. Launch each detached (`( nohup bash … & )
 
 ## 5. Campaign log (newest first)
 
+- **2026-06-18 — Q4 battery confirms Q4 is the quality answer (only build that does complex tasks).**
+  Ran the battery on the full-expert **Q4** (streamed, ~1.08 t/s gen). On the **hard** prompt Q4
+  lists 1–5 and then **produces the interesting facts** ("Mercury is the smallest planet and closest
+  to the Sun, no moons", "Venus is the hottest planet", "Jupiter is the largest planet") — the actual
+  task. **No Q2 variant (baseline, imatrix, dense, down4) ever produced a single fact** — they loop on
+  the list. Q4 still over-generates/repeats after the first pass (greedy-not-stopping, fixable with a
+  stop + sampling), but the *content* clears the 2-bit ceiling. **Final recommendation:** Q4 for
+  quality (speed acceptable per user), imatrix-dense Q2 for resident speed. Deleted the superseded
+  inferior variants (1399-tok imatrix, down4) after capturing their benchmarks here.
 - **2026-06-18 — external off-the-shelf GGUFs surveyed; none beats our Q4 for quality, none loads
   in ds4.** Checked three HuggingFace GLM-5.2 GGUFs (user request): `unsloth/GLM-5.2-GGUF`
   (UD-IQ2_XXS 238 GB / UD-IQ2_M 239 GB, full 256 experts), `pipenetwork/GLM-5.2-REAP50-Q2_K`
