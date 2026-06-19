@@ -340,6 +340,25 @@ quantitative metric (TBD as candidates land).
 | 06-18 | **A (imatrix, gate/up, 1399-tok calib)** | 218.9 GiB | resident | ~11 | 8.67 (noise) | — | **short greedy now lists all 5 planets** (baseline looped on "Mercury") | **clear win on coherence**; long/sampled still degenerate |
 | 06-18 | A0 (down Q2_K weighted) | dropped | — | — | — | — | — | subsumed by A (real imatrix weights down too once collected) |
 
+### 4.5 Running an iteration (notible)
+
+All scripts manage the prod server themselves (stop with a trap that always restarts it) and
+write artifacts to `/Volumes/4TB-1`. Launch each detached (`( nohup bash … & )`) and poll its log.
+
+- **One full imatrix iteration** (collect → build → eval), parameterized by a label, token
+  budget, and (optional) dataset:
+  ```sh
+  scripts/glm-imatrix-iterate.sh dense 20000   # 20k-token imatrix from rendered_prompts.txt
+  ```
+  Produces `/Volumes/4TB-1/glm-5.2.imatrix-<label>.dat`,
+  `glm-5.2-q2-imatrix-<label>.gguf`, and an eval under `/tmp/glm-q2-eval/imatrix-<label>/`.
+- **Recipe sweep** (no imatrix): `scripts/glm-q2-build.sh OUT.gguf --down-type q4_k` then
+  `scripts/glm-q2-eval.sh OUT.gguf LABEL` (or chain with `glm-after-build-eval.sh`).
+- **Collection knobs:** `DATASET=…` overrides the calibration corpus; `--imatrix-max-tokens N`
+  bounds it. Builds are ~95–110 min (IQ2_XXS codebook search dominates); collection ~1 min per
+  ~150–600 tokens (slower as the per-prompt KV grows). Promote a winner by copying it over
+  `glm-5.2-q2.gguf`.
+
 ---
 
 ## 5. Campaign log (newest first)
