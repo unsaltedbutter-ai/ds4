@@ -38,10 +38,14 @@ echo "prod down $(date)" >>"$OUT/run.log"
 cd "$DS4DIR" || { echo "ABORT: no $DS4DIR" >>"$OUT/run.log"; echo ABORTED >"$OUT/DONE"; exit 1; }
 [ -x ./ds4 ] || { echo "ABORT: no ./ds4" >>"$OUT/run.log"; echo ABORTED >"$OUT/DONE"; exit 1; }
 
+# DS4_EXTRA passes extra ds4 flags (e.g. --ssd-streaming for a >256 GB candidate).
+# NOPPL=1 skips perplexity (it is uninformative for GLM, and far too slow when streaming).
 # --- 1. perplexity: 2000 scored tokens, ctx 2048 (same for every candidate) ---
-echo "=== perplexity @ $(date) ===" >>"$OUT/run.log"
-./ds4 -m "$MODEL" -c 2048 -n 2000 --perplexity-file "$PPLTXT" >"$OUT/ppl.out" 2>"$OUT/ppl.err"
-echo "  $(grep -E 'ppl=' "$OUT/ppl.out" 2>/dev/null | tail -1)" >>"$OUT/run.log"
+if [ "${NOPPL:-0}" != "1" ]; then
+    echo "=== perplexity @ $(date) ===" >>"$OUT/run.log"
+    ./ds4 -m "$MODEL" -c 2048 -n 2000 ${DS4_EXTRA:-} --perplexity-file "$PPLTXT" >"$OUT/ppl.out" 2>"$OUT/ppl.err"
+    echo "  $(grep -E 'ppl=' "$OUT/ppl.out" 2>/dev/null | tail -1)" >>"$OUT/run.log"
+fi
 
 # --- 2. battery: greedy is the deterministic signal; one sampled long run too ---
 # Set PPLONLY=1 to skip the battery (fast iteration: perplexity is the primary metric).
@@ -53,7 +57,7 @@ SHORT="List the first five planets from the Sun."
 LONG="List the first five planets from the Sun and give one interesting fact about each one."
 gen() { # name prompt nmax temp topp
     echo "=== $1 temp=$4 top_p=$5 @ $(date) ===" >>"$OUT/run.log"
-    ./ds4 -m "$MODEL" -c 2048 -n "$3" --temp "$4" --top-p "$5" -p "$2" >"$OUT/$1.out" 2>"$OUT/$1.err"
+    ./ds4 -m "$MODEL" -c 2048 -n "$3" --temp "$4" --top-p "$5" ${DS4_EXTRA:-} -p "$2" >"$OUT/$1.out" 2>"$OUT/$1.err"
 }
 gen short_t0  "$SHORT" 100 0   1.0
 gen long_t0   "$LONG"  240 0   1.0

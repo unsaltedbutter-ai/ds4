@@ -337,7 +337,8 @@ quantitative metric (TBD as candidates land).
 |---|---|---|---|---|---|---|---|---|
 | 06-18 | **baseline** Q2 (IQ2_XXS g/u synth-imat, Q2_K down unweighted) | 218.9 GiB | resident | ~11.4 | 8.56 (1258 tok) / 8.07 (320 tok) | ref | loops (§2.3) | reference point |
 | 06-18 | _anchor_ Q4 (Q4_K experts) | 408.7 GiB | streaming | ~0.76 | **8.03** (320 tok) | — | coherent | Q4≈Q2 on prose → ppl uninformative (§4.1 note) |
-| 06-18 | **A (imatrix, gate/up, 1399-tok calib)** | 218.9 GiB | resident | ~11 | 8.67 (noise) | — | **short greedy now lists all 5 planets** (baseline looped on "Mercury") | **clear win on coherence**; long/sampled still degenerate |
+| 06-18 | **A-dense (imatrix gate/up, 20k-tok calib)** | 218.9 GiB | resident | ~11 | 8.73 (noise) | — | **short greedy: clean correct numbered list 1–5 (repeated cleanly)** — best Q2 | **recommended Q2**; long/complex still degenerates (gate/up 2-bit ceiling) |
+| 06-18 | A (imatrix, gate/up, 1399-tok calib) | 218.9 GiB | resident | ~11 | 8.67 (noise) | — | short greedy lists all 5 planets (baseline looped on "Mercury") | clear win vs baseline; dense is a bit cleaner |
 | 06-18 | A0 (down Q2_K weighted) | dropped | — | — | — | — | — | subsumed by A (real imatrix weights down too once collected) |
 
 ### 4.5 Running an iteration (notible)
@@ -363,6 +364,19 @@ write artifacts to `/Volumes/4TB-1`. Launch each detached (`( nohup bash … & )
 
 ## 5. Campaign log (newest first)
 
+- **2026-06-18 — denser imatrix (20k tok) is the best resident Q2; the hard-prompt ceiling is
+  the 2-bit gate/up.** Collected a 20k-token / 12M-observation imatrix (~625 obs/expert/layer,
+  ~14x the first) from the 4700-block corpus and rebuilt. **Short greedy: a clean, correct
+  numbered planet list 1–5** (the first imatrix had a repeat-error; the baseline looped on
+  "Mercury") — the best Q2 yet, same 219 GiB / resident / ~11 t/s. **But the long/complex prompt
+  still degenerates** (collapses to "1." spam), same as baseline/first. **Conclusion:** the
+  imatrix maximizes resident-Q2 coherence on simpler prompts, but it cannot lift the hard-prompt
+  ceiling, which is the **IQ2_XXS 2-bit gate/up** capacity limit — and gate/up can only be
+  IQ2_XXS or Q4_K (no Q2_K kernel), so the only thing that fixes hard prompts is Q4-level gate/up
+  (i.e. the streaming Q4 model). `glm-5.2-q2-imatrix-dense.gguf` is the **recommended Q2**.
+  Prose ppl drifted 8.56→8.67→8.73 across the imatrix builds (wrong direction) — final proof
+  that prose ppl is the wrong metric here; greedy behavior is the signal. Next: test the user's
+  "bigger Q2 / streaming OK" lever (down→Q4_K) to confirm down bits don't lift the gate/up ceiling.
 - **2026-06-18 — Option A result: the real imatrix improves Q2 coherence (clear win).**
   Built `glm-5.2-q2-imatrix.gguf` (same recipe as baseline Q2 but IQ2_XXS gate/up weighted by
   the real 1399-token activation imatrix; down stays synthetic). Same 219 GiB, resident, ~11 t/s.
