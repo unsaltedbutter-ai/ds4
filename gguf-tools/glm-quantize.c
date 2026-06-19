@@ -860,6 +860,23 @@ static void exp_range(int e0, int e1, void *c) {
 static ds4q_type g_exp_gu_type = DS4Q_TYPE_Q4_K;
 static ds4q_type g_exp_down_type = DS4Q_TYPE_Q4_K;
 
+/* --q4-layers: per-layer gate/up upgrade to Q4_K.  The only sub-Q4 gate/up option is
+ * IQ2_XXS (no Q2_K pair_swiglu kernel), so upgrading a few sensitive layers' gate/up
+ * to Q4_K is the way to target the hard-prompt 2-bit gate/up ceiling at far less than
+ * full-Q4 size.  The engine selects the per-layer kernel by tensor type, so mixing
+ * IQ2_XXS and Q4_K gate/up across layers is fine. */
+static bool g_layer_gu_q4[256] = {0};
+static void parse_q4_layers(const char *s) {
+    while (*s) {
+        char *end;
+        long v = strtol(s, &end, 10);
+        if (end == s) break;
+        if (v >= 0 && v < 256) g_layer_gu_q4[v] = true;
+        s = end;
+        while (*s == ',' || *s == ' ') s++;
+    }
+}
+
 /* Map a CLI type name to a ds4q_type.  Only the types the converter can actually
  * emit AND the engine has Metal MoE kernels for are accepted. */
 static ds4q_type parse_qtype(const char *s) {
@@ -899,10 +916,11 @@ static tplan *build_plan(int n_layers, int *count) {
             plan_add(&p,&n,&cap,NM("ffn_up_shexp.weight"),  DS4Q_TYPE_Q8_0,2,6144,2048,0, HF("mlp.shared_experts.up_proj.weight"));
             plan_add(&p,&n,&cap,NM("ffn_down_shexp.weight"),DS4Q_TYPE_Q8_0,2,2048,6144,0, HF("mlp.shared_experts.down_proj.weight"));
             char tmpl[256];
+            const ds4q_type gu = g_layer_gu_q4[L] ? DS4Q_TYPE_Q4_K : g_exp_gu_type;
             snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.gate_proj.weight",L);
-            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_gate_exps.weight"),g_exp_gu_type,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_gate_exps.weight"),gu,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
             snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.up_proj.weight",L);
-            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_up_exps.weight"),  g_exp_gu_type,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
+            { tplan *t = plan_add(&p,&n,&cap,NM("ffn_up_exps.weight"),  gu,3,6144,2048,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
             snprintf(tmpl,sizeof(tmpl),"model.layers.%d.mlp.experts.%%d.down_proj.weight",L);
             { tplan *t = plan_add(&p,&n,&cap,NM("ffn_down_exps.weight"),g_exp_down_type,3,2048,6144,256,tmpl); t->kind=SRC_EXPERT; t->layer=L; }
         }
@@ -1162,6 +1180,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--q2") == 0) { g_exp_gu_type = DS4Q_TYPE_IQ2_XXS; g_exp_down_type = DS4Q_TYPE_Q2_K; }
         else if (strcmp(argv[i], "--gu-type") == 0 && i + 1 < argc) g_exp_gu_type = parse_qtype(argv[++i]);
         else if (strcmp(argv[i], "--down-type") == 0 && i + 1 < argc) g_exp_down_type = parse_qtype(argv[++i]);
+        else if (strcmp(argv[i], "--q4-layers") == 0 && i + 1 < argc) parse_q4_layers(argv[++i]);
         else if (strcmp(argv[i], "--imatrix") == 0 && i + 1 < argc) imatrix_load(argv[++i]);
         else if (strcmp(argv[i], "--verify") == 0 && i + 1 < argc) verify_in = argv[++i];
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = true;
