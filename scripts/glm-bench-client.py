@@ -10,6 +10,7 @@ LABEL, BASE_URL, OUTDIR = sys.argv[1], sys.argv[2], sys.argv[3]
 import os
 TEMP = float(os.environ.get("BENCH_TEMP", "0"))
 REASONING = os.environ.get("BENCH_REASONING", "none")  # none|high|max
+MAXTOK = int(os.environ.get("BENCH_MAXTOK", "200"))    # raise for reasoning (think+answer)
 
 # General battery: factual, factual+complex (the "hard" prompt), reasoning, code,
 # and a categorization-style prompt from the user's domain.
@@ -24,7 +25,7 @@ BATTERY = [
 def call(content):
     body = json.dumps({
         "messages": [{"role": "user", "content": content}],
-        "max_tokens": 200, "temperature": TEMP, "top_p": 0.95,
+        "max_tokens": MAXTOK, "temperature": TEMP, "top_p": 0.95,
         "reasoning_effort": REASONING,
     }).encode()
     req = urllib.request.Request(BASE_URL.rstrip("/") + "/v1/chat/completions",
