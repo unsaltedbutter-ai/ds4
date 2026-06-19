@@ -22,11 +22,14 @@ Q4 (≈409 GiB) cannot be resident on 256 GB and is disk-bound (~0.76 tok/s); Q2
 >   do complex prompts — the **2-bit IQ2_XXS gate/up ceiling**, which no Q2 recipe (denser imatrix,
 >   down→Q4_K) lifts; only Q4-level gate/up does. Reproduce via `scripts/glm-imatrix-iterate.sh`.
 >
-> **Why not the others:** a 2-bit Q2 (any recipe, ours or external) hits the same complex-prompt
-> ceiling. External HuggingFace GGUFs (unsloth UD-IQ2, REAP50 Q2/Q3) **don't load in ds4** (glm-dsa
-> format, patched-llama.cpp-only) and aren't higher quality (REAP50 is expert-pruned + degraded;
-> unsloth is 2-bit). `--q4-layers` (lift a few layers' gate/up to Q4) is a built-but-untested
-> middle option if you want better-than-Q2 quality at faster-than-Q4 speed.
+> **No usable middle tier exists** between these two (tested exhaustively — §5): lifting *some*
+> layers' gate/up to Q4 (`--q4-layers`) either doesn't help (≤~12 layers, the most that fits
+> resident) or can't run (more layers → too big for resident, and the Q4_K-only streaming kernels
+> garble a model whose down is still Q2_K). The only thing that streams correctly with Q4 gate/up is
+> *uniform* Q4_K — i.e. full Q4. External HuggingFace GGUFs (unsloth UD-IQ2, REAP50 Q2/Q3) **don't
+> load in ds4** (glm-dsa, patched-llama.cpp-only) and aren't higher quality (REAP50 is pruned +
+> degraded; unsloth is 2-bit). A faster-than-Q4 / near-Q4-quality middle tier (~356 GiB, ~3.5 t/s)
+> is *possible* but needs a streaming-path fix for non-uniform expert precision — see §5 follow-up.
 
 ---
 
@@ -247,7 +250,15 @@ are the natural "better than IQ2_XXS at ~the same size" upgrades for gate/up; Q3
 are mid-bit options for down or sensitive layers. **Caveat — this is the most expensive
 option:** each new type needs *both* a converter quantizer in `quants.c` *and* a Metal MoE
 dequant/matmul kernel in `metal/moe.metal` (the runtime only has IQ2_XXS/Q2_K/Q4_K expert
-kernels). Pursue only if A + B leave quality short.
+kernels).
+
+> **Status (2026-06-19): not pursued — blocked by the same wall as `--q4-layers`.** A 3-bit
+> gate/up model (e.g. all Q3_K gate/up, ~280 GiB) is too big to be resident (~240 GiB cap) and
+> would need a Q3_K *streaming* slots8 kernel (which doesn't exist) — the same non-uniform-precision
+> streaming limitation that kills the `--q4-layers` middle tier (§5). So implementing IQ2_S/Q3_K
+> would *also* require the streaming-path fix to be usable. The cheaper prerequisite is therefore
+> the streaming fix itself; new quant *types* are only worth it after that, and only if a 3-bit
+> point proves better quality-per-GiB than the Q4-gate/up point.
 
 ### Option D — 8-bit latent KV (enabler, not a direct expert-quality lever)
 
@@ -367,7 +378,7 @@ quantitative metric (TBD as candidates land).
 | 06-18 | A (imatrix, gate/up, 1399-tok calib) | 218.9 GiB | resident | ~11 | 8.67 (noise) | — | short greedy lists all 5 planets (baseline looped on "Mercury") | clear win vs baseline; dense is a bit cleaner |
 | 06-18 | down4 (imatrix gate/up + **down Q4_K**) | 272 GiB | **streaming ~0.3 t/s** | 0.3 | — | — | short: lists 5; long: enumerates but still repeats/no facts | **not worth it** — more down bits don't lift the gate/up 2-bit ceiling; 35x slower for a marginal long-prompt gain |
 | 06-19 | q4gu-last8 (last 8 layers' gate/up → Q4_K + imatrix) | 234 GiB | **resident ~11.4 t/s** | 11.4 | — | — | short: correct list; long: lists, **no facts** (= imatrix-dense) | 8 Q4 layers insufficient; **broken under `--ssd-streaming`** (mixed expert sizes → garbage), so resident-only → capped at ~8–12 layers |
-| 06-19 | q4gu-all (all 75 layers' gate/up → Q4_K + imatrix, Q2_K down) | ~366 GiB | streaming | _building_ | — | — | _pending_ | decisive: does max gate/up (no Q4 down) clear the hard prompt? |
+| 06-19 | q4gu-all (all 75 layers' gate/up → Q4_K + imatrix, Q2_K down) | 356 GiB | streaming | (3.5) | — | — | **garbage (`!!!!`)** — never produced text | **unusable**: too big for resident; streaming slots8 kernels are **Q4_K-only** (gate/up AND down) and misread the Q2_K down. Couldn't be evaluated for quality |
 | 06-18 | A0 (down Q2_K weighted) | dropped | — | — | — | — | — | subsumed by A (real imatrix weights down too once collected) |
 
 ### 4.5 Running an iteration (notible)
@@ -402,8 +413,17 @@ write artifacts to `/Volumes/4TB-1`. Launch each detached (`( nohup bash … & )
   fine resident at **11.4 t/s** and is coherent, but on the hard prompt it **still gives no facts**
   (= imatrix-dense) — 8 Q4 layers don't lift the ceiling, and the streaming bug caps resident partials
   at ~8–12 layers, so partial-`--q4-layers` is a dead end for the hard prompt. **q4gu-all** (all 75
-  layers' gate/up → Q4_K, uniform so streaming works, ~366 GiB) is building — the decisive test of
-  whether max gate/up (with Q2_K down) clears the hard prompt without needing full Q4.
+  layers' gate/up → Q4_K + Q2_K down, 356 GiB) **also came back garbage** (`!!!!`): too big to be
+  resident, and the streaming slots8 kernels are **Q4_K-only** (gate/up *and* down) so they misread
+  the Q2_K down. **Conclusion — the `--q4-layers` lever yields no usable middle tier:** resident
+  partials (≤~12 layers) don't help the hard prompt, and any config with enough Q4 gate/up is too
+  big for resident and only streams correctly if *everything* (incl. down) is Q4_K — i.e. the full
+  Q4 model. So the usable options remain **imatrix-Q2 (219 GiB resident, simple prompts) and full Q4
+  (409 GiB streamed, complex prompts)**, with nothing usable in between. Unlocking a middle tier
+  (e.g. Q4 gate/up + cheap Q2_K down, ~356 GiB, which streamed at ~3.5 t/s before producing garbage —
+  3× faster than Q4 *if* it worked) would require a **streaming-path fix**: slots8 kernels / an expert
+  cache that handle non-uniform expert precision (Q2_K down with Q4_K gate/up). That is a real engine
+  project, flagged as the follow-up. Deleted q4gu-last8 + q4gu-all (benchmarks captured).
 - **2026-06-18 — Q4 battery confirms Q4 is the quality answer (only build that does complex tasks).**
   Ran the battery on the full-expert **Q4** (streamed, ~1.08 t/s gen). On the **hard** prompt Q4
   lists 1–5 and then **produces the interesting facts** ("Mercury is the smallest planet and closest
