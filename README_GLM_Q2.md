@@ -374,6 +374,18 @@ write artifacts to `/Volumes/4TB-1`. Launch each detached (`( nohup bash … & )
 
 ## 5. Campaign log (newest first)
 
+- **2026-06-18 — external off-the-shelf GGUFs surveyed; none beats our Q4 for quality, none loads
+  in ds4.** Checked three HuggingFace GLM-5.2 GGUFs (user request): `unsloth/GLM-5.2-GGUF`
+  (UD-IQ2_XXS 238 GB / UD-IQ2_M 239 GB, full 256 experts), `pipenetwork/GLM-5.2-REAP50-Q2_K`
+  (139 GB) and `-Q3_K_M` (182 GB). **All are `glm-dsa` format requiring a *patched* llama.cpp**
+  (stock llama.cpp can't load GLM-5.2; ds4 can't load them at all — it needs its own `deepseek4.*`
+  metadata + absorbed-MLA + stacked experts). **REAP50 is 50%-expert-*pruned*** (128/256, ~394 B
+  params) — architecturally unsupported by ds4, and its cards say "not a quality champion / fragile,
+  ~+37.5% perplexity vs full GLM-5.2, collapses to repetition on greedy." unsloth's are full-expert
+  but 2-bit (our Q2 class). **Conclusion:** for *best quality* none of these wins — our full-expert
+  **Q4** (4-bit, 256 experts) is higher quality than any pruned/2-bit external build, and adopting an
+  external one means switching to a separate patched-llama.cpp stack. (notible has no llama.cpp / hf-cli.)
+  So the quality answer is our own Q4; battery-testing it to confirm it clears the hard prompt.
 - **2026-06-18 — down→Q4_K (streaming) confirms gate/up is the bottleneck; campaign conclusion.**
   Built `down4` = dense-imatrix gate/up (IQ2_XXS) + **down Q4_K** (272 GiB, streams via the
   CPU-routed mmap path since gate/up isn't Q4_K). On the **short** prompt it lists all five
