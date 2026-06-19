@@ -366,6 +366,8 @@ quantitative metric (TBD as candidates land).
 | 06-18 | **A-dense (imatrix gate/up, 20k-tok calib)** | 218.9 GiB | resident | ~11 | 8.73 (noise) | — | **short greedy: clean correct numbered list 1–5 (repeated cleanly)** — best Q2 | **recommended Q2**; long/complex still degenerates (gate/up 2-bit ceiling) |
 | 06-18 | A (imatrix, gate/up, 1399-tok calib) | 218.9 GiB | resident | ~11 | 8.67 (noise) | — | short greedy lists all 5 planets (baseline looped on "Mercury") | clear win vs baseline; dense is a bit cleaner |
 | 06-18 | down4 (imatrix gate/up + **down Q4_K**) | 272 GiB | **streaming ~0.3 t/s** | 0.3 | — | — | short: lists 5; long: enumerates but still repeats/no facts | **not worth it** — more down bits don't lift the gate/up 2-bit ceiling; 35x slower for a marginal long-prompt gain |
+| 06-19 | q4gu-last8 (last 8 layers' gate/up → Q4_K + imatrix) | 234 GiB | **resident ~11.4 t/s** | 11.4 | — | — | short: correct list; long: lists, **no facts** (= imatrix-dense) | 8 Q4 layers insufficient; **broken under `--ssd-streaming`** (mixed expert sizes → garbage), so resident-only → capped at ~8–12 layers |
+| 06-19 | q4gu-all (all 75 layers' gate/up → Q4_K + imatrix, Q2_K down) | ~366 GiB | streaming | _building_ | — | — | _pending_ | decisive: does max gate/up (no Q4 down) clear the hard prompt? |
 | 06-18 | A0 (down Q2_K weighted) | dropped | — | — | — | — | — | subsumed by A (real imatrix weights down too once collected) |
 
 ### 4.5 Running an iteration (notible)
@@ -391,6 +393,17 @@ write artifacts to `/Volumes/4TB-1`. Launch each detached (`( nohup bash … & )
 
 ## 5. Campaign log (newest first)
 
+- **2026-06-19 — `--q4-layers` sweep + a streaming bug found.** Testing the last untested lever
+  (lift selected layers' gate/up to Q4_K on top of the imatrix). **Engine bug found:** a model with
+  *mixed* expert sizes across layers (some Q4_K gate/up, some IQ2_XXS) is **broken under
+  `--ssd-streaming`** — the streaming expert cache has a single slab size class, so the off-size-class
+  layers "bypass the cache and read via mapped model views" and produce garbage (token-0 `!!!!`). Such
+  mixed models must run **resident**. **q4gu-last8** (last 8 layers' gate/up → Q4_K, 234 GiB) runs
+  fine resident at **11.4 t/s** and is coherent, but on the hard prompt it **still gives no facts**
+  (= imatrix-dense) — 8 Q4 layers don't lift the ceiling, and the streaming bug caps resident partials
+  at ~8–12 layers, so partial-`--q4-layers` is a dead end for the hard prompt. **q4gu-all** (all 75
+  layers' gate/up → Q4_K, uniform so streaming works, ~366 GiB) is building — the decisive test of
+  whether max gate/up (with Q2_K down) clears the hard prompt without needing full Q4.
 - **2026-06-18 — Q4 battery confirms Q4 is the quality answer (only build that does complex tasks).**
   Ran the battery on the full-expert **Q4** (streamed, ~1.08 t/s gen). On the **hard** prompt Q4
   lists 1–5 and then **produces the interesting facts** ("Mercury is the smallest planet and closest
