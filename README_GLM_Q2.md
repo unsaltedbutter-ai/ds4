@@ -9,6 +9,15 @@ It is the Q2-quality companion to `README-GLM.md` (getting-started) and `glm-por
 (the port tracker). For why Q2 (not Q4) is the speed target, see `glm-port-plan.md` §4/§6:
 Q4 (≈409 GiB) cannot be resident on 256 GB and is disk-bound (~0.76 tok/s); Q2 fits.
 
+> **RECOMMENDATION (2026-06-18, after the improvement campaign):** the best resident Q2 is
+> **`/Volumes/4TB-1/glm-5.2-q2-imatrix-dense.gguf`** — same 219 GiB / resident / ~11 t/s as the
+> original Q2, but its IQ2_XXS gate/up experts are weighted by a **real 20k-token activation
+> imatrix** instead of a synthetic proxy. It is clearly more coherent on simpler prompts (greedy
+> gives a clean correct planet list where the original loops on "Mercury"). Complex/long prompts
+> still degenerate — that is the **2-bit IQ2_XXS gate/up ceiling**, which neither a denser imatrix
+> nor down→Q4_K fixes; only Q4-level gate/up does (use the streamed Q4, or `--q4-layers` to lift a
+> few sensitive layers' gate/up to Q4). See §5 for the full campaign and §1/§3 for how/why.
+
 ---
 
 ## 1. How the current Q2 was created
@@ -339,6 +348,7 @@ quantitative metric (TBD as candidates land).
 | 06-18 | _anchor_ Q4 (Q4_K experts) | 408.7 GiB | streaming | ~0.76 | **8.03** (320 tok) | — | coherent | Q4≈Q2 on prose → ppl uninformative (§4.1 note) |
 | 06-18 | **A-dense (imatrix gate/up, 20k-tok calib)** | 218.9 GiB | resident | ~11 | 8.73 (noise) | — | **short greedy: clean correct numbered list 1–5 (repeated cleanly)** — best Q2 | **recommended Q2**; long/complex still degenerates (gate/up 2-bit ceiling) |
 | 06-18 | A (imatrix, gate/up, 1399-tok calib) | 218.9 GiB | resident | ~11 | 8.67 (noise) | — | short greedy lists all 5 planets (baseline looped on "Mercury") | clear win vs baseline; dense is a bit cleaner |
+| 06-18 | down4 (imatrix gate/up + **down Q4_K**) | 272 GiB | **streaming ~0.3 t/s** | 0.3 | — | — | short: lists 5; long: enumerates but still repeats/no facts | **not worth it** — more down bits don't lift the gate/up 2-bit ceiling; 35x slower for a marginal long-prompt gain |
 | 06-18 | A0 (down Q2_K weighted) | dropped | — | — | — | — | — | subsumed by A (real imatrix weights down too once collected) |
 
 ### 4.5 Running an iteration (notible)
@@ -364,6 +374,18 @@ write artifacts to `/Volumes/4TB-1`. Launch each detached (`( nohup bash … & )
 
 ## 5. Campaign log (newest first)
 
+- **2026-06-18 — down→Q4_K (streaming) confirms gate/up is the bottleneck; campaign conclusion.**
+  Built `down4` = dense-imatrix gate/up (IQ2_XXS) + **down Q4_K** (272 GiB, streams via the
+  CPU-routed mmap path since gate/up isn't Q4_K). On the **short** prompt it lists all five
+  planets (≈ imatrix-dense). On the **hard** prompt it *enumerates* the planets (better than
+  imatrix-dense's "1." collapse) but **still repeats with errors and never gives the facts** —
+  a marginal gain for **+53 GiB and ~35× slower** (~0.3 t/s streaming). So spending bits on the
+  down_proj does **not** lift the hard-prompt ceiling: the bottleneck is the **2-bit IQ2_XXS
+  gate/up**, and the only fix is Q4-level gate/up. Added a `--q4-layers` converter flag (upgrade
+  selected layers' gate/up to Q4_K) as the principled next lever for the hard prompt — a few
+  sensitive layers at Q4 gate/up, mostly resident — to try if/when desired. **Recommendation:
+  `glm-5.2-q2-imatrix-dense.gguf` is the best resident Q2 (219 GiB, ~11 t/s); use Q4 (streamed)
+  for hard prompts where quality must hold.**
 - **2026-06-18 — denser imatrix (20k tok) is the best resident Q2; the hard-prompt ceiling is
   the 2-bit gate/up.** Collected a 20k-token / 12M-observation imatrix (~625 obs/expert/layer,
   ~14x the first) from the 4700-block corpus and rebuilt. **Short greedy: a clean, correct
